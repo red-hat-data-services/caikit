@@ -17,11 +17,14 @@ Tests for the caikit HTTP server
 # Standard
 from contextlib import contextmanager
 from dataclasses import dataclass
+from io import BytesIO
+from pathlib import Path
 from typing import Dict
 import json
 import os
 import signal
 import tempfile
+import zipfile
 
 # Third Party
 from fastapi.testclient import TestClient
@@ -294,12 +297,13 @@ def test_docs_using_running_http_server(runtime_http_server):
 def test_inference_sample_task(sample_task_model_id, runtime_http_server):
     """Simple check that we can ping a model"""
     with TestClient(runtime_http_server.app) as client:
-        json_input = {"inputs": {"name": "world"}}
+        json_input = {"inputs": {"name": "world"}, "model_id": sample_task_model_id}
         response = client.post(
-            f"/api/v1/{sample_task_model_id}/task/sample",
+            f"/api/v1/task/sample",
             json=json_input,
         )
         json_response = json.loads(response.content.decode(response.default_encoding))
+        print(json_response)
         assert response.status_code == 200, json_response
         assert json_response["greeting"] == "Hello world"
 
@@ -310,11 +314,12 @@ def test_inference_sample_task_optional_field(
     """Simple check for optional fields"""
     with TestClient(runtime_http_server.app) as client:
         json_input = {
+            "model_id": sample_task_model_id,
             "inputs": {"name": "world"},
             "parameters": {"throw": True},
         }
         response = client.post(
-            f"/api/v1/{sample_task_model_id}/task/sample",
+            f"/api/v1/task/sample",
             json=json_input,
         )
         # this is 500 because we explicitly pass in `throw` as True, which
@@ -322,12 +327,74 @@ def test_inference_sample_task_optional_field(
         assert response.status_code == 500
 
 
+def test_inference_sample_task_multipart_input(
+    sample_task_model_id, runtime_http_server
+):
+    """Simple check that we can submit multipart requests"""
+
+    with TestClient(runtime_http_server.app) as client:
+        multipart_input = {
+            "model_id": sample_task_model_id,
+            "inputs.name": "world",
+            "parameters": json.dumps({"throw": False}),
+        }
+
+        response = client.post(f"/api/v1/task/sample", files=multipart_input)
+
+        json_response = json.loads(response.content.decode(response.default_encoding))
+        assert response.status_code == 200, json_response
+        assert json_response["greeting"] == "Hello world"
+
+        multipart_input["parameters"] = json.dumps({"throw": True})
+        response = client.post(
+            f"/api/v1/task/sample",
+            files=multipart_input,
+        )
+        # this is 500 because we explicitly pass in `throw` as True, which
+        # raises an internal error in the module
+        assert response.status_code == 500
+
+
+def test_inference_file_task_multipart_flipped_input(
+    file_task_model_id, runtime_http_server
+):
+    """Ensure that multiple multipart json inputs are merged together instead of overriding"""
+    with TestClient(runtime_http_server.app) as client:
+        # cGRmZGF0Yf//AA== is b"pdfdata\xff\xff\x00" base64 encoded
+        temp_file = tempfile.NamedTemporaryFile()
+        temp_file_name = Path(temp_file.name).name
+        temp_file.write(b"pdfdata\xff\xff\x00")
+        temp_file.flush()
+        temp_file.seek(0)
+
+        file_input = {
+            "model_id": file_task_model_id,
+            "inputs.file": temp_file,
+            "inputs": json.dumps({"metadata": {"name": "agoodname"}}),
+        }
+
+        response = client.post(
+            f"/api/v1/task/file",
+            files=file_input,
+        )
+        content_stream = BytesIO(response.content)
+
+        assert response.status_code == 200
+        with zipfile.ZipFile(content_stream) as output_file:
+            assert len(output_file.namelist()) == 2
+            assert "metadata.json" in output_file.namelist()
+            assert f"processed_{temp_file_name}" in output_file.namelist()
+
+            with output_file.open(f"processed_{temp_file_name}") as pdf_result:
+                assert pdf_result.read() == b"bounding|pdfdata\xff\xff\x00|box"
+
+
 def test_inference_other_task(other_task_model_id, runtime_http_server):
     """Simple check that we can ping a model"""
     with TestClient(runtime_http_server.app) as client:
-        json_input = {"inputs": {"name": "world"}}
+        json_input = {"model_id": other_task_model_id, "inputs": {"name": "world"}}
         response = client.post(
-            f"/api/v1/{other_task_model_id}/task/other",
+            f"/api/v1/task/other",
             json=json_input,
         )
         json_response = json.loads(response.content.decode(response.default_encoding))
@@ -335,29 +402,44 @@ def test_inference_other_task(other_task_model_id, runtime_http_server):
         assert json_response["farewell"] == "goodbye: world 42 times"
 
 
-def test_json_file_task(file_task_model_id, runtime_http_server):
-    """Simple check that we can ping a model"""
+def test_output_file_task(file_task_model_id, runtime_http_server):
+    """Simple check that we can get a file output"""
     with TestClient(runtime_http_server.app) as client:
         # cGRmZGF0Yf//AA== is b"pdfdata\xff\xff\x00" base64 encoded
-        json_input = {"inputs": {"filename": "example.pdf", "data": "cGRmZGF0Yf//AA=="}}
+        temp_file = tempfile.NamedTemporaryFile()
+        temp_file_name = Path(temp_file.name).name
+        temp_file.write(b"pdfdata\xff\xff\x00")
+        temp_file.flush()
+        temp_file.seek(0)
+
+        file_input = {
+            "model_id": file_task_model_id,
+            "inputs.file": temp_file,
+            "inputs.metadata": json.dumps({"name": "agoodname"}),
+        }
 
         response = client.post(
-            f"/api/v1/{file_task_model_id}/task/file",
-            json=json_input,
+            f"/api/v1/task/file",
+            files=file_input,
         )
-        json_response = json.loads(response.content.decode(response.default_encoding))
-        assert response.status_code == 200, json_response
-        assert json_response["filename"] == "processed_example.pdf"
-        # Ym91bmRpbmd8cGRmZGF0Yf//AHxib3g= is b"bounding|pdfdata\xff\xff\x00|box" base64 encoded
-        assert json_response["data"] == "Ym91bmRpbmd8cGRmZGF0Yf//AHxib3g="
+        content_stream = BytesIO(response.content)
+
+        assert response.status_code == 200
+        with zipfile.ZipFile(content_stream) as output_file:
+            assert len(output_file.namelist()) == 2
+            assert "metadata.json" in output_file.namelist()
+            assert f"processed_{temp_file_name}" in output_file.namelist()
+
+            with output_file.open(f"processed_{temp_file_name}") as pdf_result:
+                assert pdf_result.read() == b"bounding|pdfdata\xff\xff\x00|box"
 
 
 def test_inference_streaming_sample_module(sample_task_model_id, runtime_http_server):
     """Simple check for testing a happy path unary-stream case"""
     with TestClient(runtime_http_server.app) as client:
-        json_input = {"inputs": {"name": "world"}}
+        json_input = {"model_id": sample_task_model_id, "inputs": {"name": "world"}}
         stream = client.post(
-            f"/api/v1/{sample_task_model_id}/task/server-streaming-sample",
+            f"/api/v1/task/server-streaming-sample",
             json=json_input,
         )
         assert stream.status_code == 200
@@ -375,12 +457,42 @@ def test_inference_streaming_sample_module(sample_task_model_id, runtime_http_se
         )
 
 
+def test_no_model_id(runtime_http_server):
+    """Simple check that we can ping a model"""
+    with TestClient(runtime_http_server.app) as client:
+        response = client.post(
+            f"/api/v1/task/sample",
+            json={"inputs": {"name": "world"}},
+        )
+        assert response.status_code == 400
+        "Please provide model_id in payload" in response.content.decode(
+            response.default_encoding
+        )
+
+
+def test_inference_multi_task_module(multi_task_model_id, runtime_http_server):
+    """Simple check that we can ping a model"""
+    with TestClient(runtime_http_server.app) as client:
+        # cGRmZGF0Yf//AA== is b"pdfdata\xff\xff\x00" base64 encoded
+        json_input = {
+            "model_id": multi_task_model_id,
+            "inputs": {"filename": "example.pdf", "data": "cGRmZGF0Yf//AA=="},
+        }
+        response = client.post(
+            f"/api/v1/task/second",
+            json=json_input,
+        )
+        json_response = json.loads(response.content.decode(response.default_encoding))
+        assert response.status_code == 200, json_response
+        assert json_response["farewell"] == "Goodbye from SecondTask"
+
+
 def test_model_not_found(runtime_http_server):
     """Simple check that we can ping a model"""
     with TestClient(runtime_http_server.app) as client:
         response = client.post(
-            f"/api/v1/this_is_not_a_model/task/sample",
-            json={"inputs": {"name": "world"}},
+            f"/api/v1/task/sample",
+            json={"model_id": "not_an_id", "inputs": {"name": "world"}},
         )
         assert response.status_code == 404
 
@@ -392,10 +504,11 @@ def test_inference_sample_task_incorrect_input(
     instead returns None"""
     with TestClient(runtime_http_server.app) as client:
         json_input = {
+            "model_id": sample_task_model_id,
             "inputs": {"blah": "world"},
         }
         response = client.post(
-            f"/api/v1/{sample_task_model_id}/task/sample",
+            f"/api/v1/task/sample",
             json=json_input,
         )
         assert response.status_code == 422, response.content.decode(
@@ -411,10 +524,11 @@ def test_inference_sample_task_forward_compatibility(
     without any error"""
     with TestClient(runtime_http_server.app) as client:
         json_input = {
+            "model_id": sample_task_model_id,
             "inputs": {"name": "world", "blah": "blah"},
         }
         response = client.post(
-            f"/api/v1/{sample_task_model_id}/task/sample",
+            f"/api/v1/task/sample",
             json=json_input,
         )
         json_response = json.loads(response.content.decode(response.default_encoding))
@@ -506,9 +620,9 @@ def test_train_sample_task(runtime_http_server):
         )
 
         # test inferencing on new model
-        json_input_inference = {"inputs": {"name": "world"}}
+        json_input_inference = {"model_id": model_name, "inputs": {"name": "world"}}
         response = client.post(
-            f"/api/v1/{model_name}/task/sample",
+            f"/api/v1/task/sample",
             json=json_input_inference,
         )
         json_response = json.loads(response.content.decode(response.default_encoding))
@@ -592,9 +706,9 @@ def test_train_primitive_task(runtime_http_server):
         )
 
         # test inferencing on new model
-        json_input_inference = {"inputs": {"name": "world"}}
+        json_input_inference = {"model_id": model_name, "inputs": {"name": "world"}}
         response = client.post(
-            f"/api/v1/{model_name}/task/sample",
+            f"/api/v1/task/sample",
             json=json_input_inference,
         )
         json_response = json.loads(response.content.decode(response.default_encoding))
@@ -641,9 +755,9 @@ def test_train_other_task(runtime_http_server):
         )
 
         # test inferencing on new model
-        json_input_inference = {"inputs": {"name": "world"}}
+        json_input_inference = {"model_id": model_name, "inputs": {"name": "world"}}
         response = client.post(
-            f"/api/v1/{model_name}/task/other",
+            f"/api/v1/task/other",
             json=json_input_inference,
         )
         json_response = json.loads(response.content.decode(response.default_encoding))

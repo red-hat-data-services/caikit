@@ -15,9 +15,14 @@
 from typing import Iterable
 import uuid
 
+# Third Party
+import pytest
+
 # Local
 from caikit.core import LocalBackend
+from caikit.interfaces.common.data_model import File
 from caikit.runtime.service_generation.create_service import (
+    assert_compatible,
     create_inference_rpcs,
     create_training_rpcs,
 )
@@ -27,7 +32,8 @@ from sample_lib.data_model import (
     SampleOutputType,
     SampleTask,
 )
-from sample_lib.modules import SampleModule
+from sample_lib.modules import FirstTask, MultiTaskModule, SampleModule, SecondTask
+from tests.conftest import temp_config
 import caikit
 import sample_lib
 
@@ -259,6 +265,32 @@ def test_create_inference_rpcs_for_multiple_modules_of_same_type():
     assert sample_lib.modules.other_task.OtherModule in rpcs[-1].module_list
 
 
+def test_create_inference_rpcs_respects_sorted_order_by_module_id():
+    module_list = [
+        sample_lib.modules.sample_task.ListModule,  # 00af2203-0405-0607-0263-0a0b02dd0c2f
+        sample_lib.modules.sample_task.SampleModule,  # 00110203-0405-0607-0809-0a0b02dd0e0f
+        sample_lib.modules.sample_task.SamplePrimitiveModule,  # 00112233-0405-0607-0809-0a0b02dd0e0f
+    ]
+    rpcs = create_inference_rpcs(module_list)
+
+    # 3 RPCs, SampleModule, SamplePrimitiveModule and ListModule have task SampleTask with 3 flavors for
+    # streaming
+    assert len(rpcs) == 3
+    assert sample_lib.modules.sample_task.SampleModule in rpcs[0].module_list
+    assert sample_lib.modules.sample_task.SamplePrimitiveModule in rpcs[0].module_list
+    assert sample_lib.modules.sample_task.SampleModule in rpcs[1].module_list
+    assert sample_lib.modules.sample_task.SampleModule in rpcs[2].module_list
+    assert sample_lib.modules.sample_task.ListModule in rpcs[0].module_list
+
+    # check for alphabetical order of modules in rpcs[0] by Module ID
+    # this should always be deterministic
+    assert sample_lib.modules.sample_task.SampleModule == rpcs[0].module_list[0]
+    assert (
+        sample_lib.modules.sample_task.SamplePrimitiveModule == rpcs[0].module_list[1]
+    )
+    assert sample_lib.modules.sample_task.ListModule == rpcs[0].module_list[-1]
+
+
 def test_create_inference_rpcs_removes_modules_with_no_task():
     module_list = [
         sample_lib.modules.sample_task.SampleModule,  # has a task, has 3 streaming flavors
@@ -269,6 +301,36 @@ def test_create_inference_rpcs_removes_modules_with_no_task():
     assert len(rpcs) == 3
     assert sample_lib.modules.sample_task.SampleModule in rpcs[0].module_list
     assert sample_lib.modules.sample_task.InnerModule not in rpcs[0].module_list
+
+
+def test_create_inference_rpcs_uses_taskmethod_decorators():
+    rpcs = create_inference_rpcs([MultiTaskModule])
+    assert len(rpcs) == 2
+    assert MultiTaskModule in rpcs[0].module_list
+
+
+def test_create_inference_rpcs_with_included_tasks():
+    with temp_config(
+        {
+            "runtime": {
+                "service_generation": {
+                    "task_types": {"included": ["SampleTask"]},
+                }
+            }
+        }
+    ) as cfg:
+        rpcs = create_inference_rpcs([SampleModule, MultiTaskModule], cfg)
+        assert len(rpcs) == 3
+        assert rpcs[0].task == SampleTask
+
+
+def test_create_inference_rpcs_with_excluded_tasks():
+    with temp_config(
+        {"runtime": {"service_generation": {"task_types": {"excluded": ["FirstTask"]}}}}
+    ) as cfg:
+        rpcs = create_inference_rpcs([MultiTaskModule], cfg)
+        assert len(rpcs) == 1
+        assert rpcs[0].task == SecondTask
 
 
 ### create_training_rpcs tests #################################################
@@ -303,3 +365,38 @@ def test_create_training_rpcs():
     rpcs = create_training_rpcs([widget_class])
     assert len(rpcs) == 1
     assert widget_class in rpcs[0].module_list
+
+
+### assert_compatible tests #################################################
+def test_assert_compatible_does_not_raise_if_modules_continue_to_be_supported():
+    previous_module_list = [
+        sample_lib.modules.sample_task.SampleModule.MODULE_ID,
+        sample_lib.modules.sample_task.InnerModule.MODULE_ID,
+    ]
+
+    current_module_list = [
+        sample_lib.modules.sample_task.SampleModule.MODULE_ID,
+        sample_lib.modules.sample_task.InnerModule.MODULE_ID,
+        sample_lib.modules.other_task.OtherModule.MODULE_ID,
+    ]
+    assert_compatible(current_module_list, previous_module_list)
+
+
+def test_assert_compatible_raises_if_modules_are_no_longer_supported():
+    previous_module_list = [
+        sample_lib.modules.sample_task.SampleModule.MODULE_ID,
+        sample_lib.modules.sample_task.InnerModule.MODULE_ID,
+    ]
+
+    current_module_list = [
+        sample_lib.modules.sample_task.SampleModule.MODULE_ID,
+        sample_lib.modules.other_task.OtherModule.MODULE_ID,
+    ]  # missing InnerModule from prev
+
+    with pytest.raises(ValueError) as context:
+        assert_compatible(current_module_list, previous_module_list)
+    assert (
+        "BREAKING CHANGE! Found unsupported module(s) that were previously supported: "
+        in str(context.value)
+        and sample_lib.modules.sample_task.InnerModule.MODULE_ID in str(context.value)
+    )

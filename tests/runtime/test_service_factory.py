@@ -15,7 +15,10 @@
 """Unit tests for the service factory"""
 # Standard
 from pathlib import Path
+import json
+import os
 import tempfile
+import uuid
 
 # Third Party
 from google.protobuf.message import Message
@@ -32,6 +35,7 @@ from caikit.runtime.service_factory import (
 )
 from sample_lib import SampleModule
 from sample_lib.data_model import SampleInputType, SampleOutputType
+from sample_lib.data_model.sample import SampleTask
 from sample_lib.modules import ListModule, OtherModule
 from tests.conftest import temp_config
 from tests.core.helpers import MockBackend
@@ -106,16 +110,6 @@ MODULE_LIST = [
 
 
 ### Test ServicePackageFactory._get_and_filter_modules function
-def test_get_and_filter_modules_respects_excluded_task_type():
-    with temp_config(
-        {
-            "runtime": {
-                "service_generation": {"task_types": {"excluded": ["SampleTask"]}}
-            }
-        }
-    ) as cfg:
-        clean_modules = ServicePackageFactory._get_and_filter_modules(cfg, "sample_lib")
-        assert "SampleModule" not in str(clean_modules)
 
 
 def test_get_and_filter_modules_respects_excluded_modules():
@@ -129,45 +123,12 @@ def test_get_and_filter_modules_respects_excluded_modules():
             }
         }
     ) as cfg:
-        clean_modules = ServicePackageFactory._get_and_filter_modules(cfg, "sample_lib")
+        clean_modules = ServicePackageFactory._get_and_filter_modules(
+            cfg, "sample_lib", False
+        )
         assert "ListModule" not in str(clean_modules)
         assert "SampleModule" in str(clean_modules)
         assert "OtherModule" in str(clean_modules)
-
-
-def test_get_and_filter_modules_respects_excluded_modules_and_excluded_task_type():
-    assert "InnerModule" in str(MODULE_LIST)
-    with temp_config(
-        {
-            "runtime": {
-                "service_generation": {
-                    "module_guids": {"excluded": [ListModule.MODULE_ID]},
-                    "task_types": {"excluded": ["OtherTask"]},
-                }
-            }
-        }
-    ) as cfg:
-        clean_modules = ServicePackageFactory._get_and_filter_modules(cfg, "sample_lib")
-        assert "ListModule" not in str(clean_modules)
-        assert "OtherModule" not in str(clean_modules)
-        assert "SampleModule" in str(clean_modules)
-
-
-def test_get_and_filter_modules_respects_included_modules_and_included_task_types():
-    with temp_config(
-        {
-            "runtime": {
-                "service_generation": {
-                    "module_guids": {"included": [ListModule.MODULE_ID]},
-                    "task_types": {"included": ["OtherTask"]},
-                }
-            }
-        }
-    ) as cfg:
-        clean_modules = ServicePackageFactory._get_and_filter_modules(cfg, "sample_lib")
-        assert len(clean_modules) == 2
-        assert "OtherModule" in str(clean_modules)
-        assert "ListModule" in str(clean_modules)
 
 
 def test_get_and_filter_modules_respects_included_modules():
@@ -180,43 +141,115 @@ def test_get_and_filter_modules_respects_included_modules():
             }
         }
     ) as cfg:
-        clean_modules = ServicePackageFactory._get_and_filter_modules(cfg, "sample_lib")
+        clean_modules = ServicePackageFactory._get_and_filter_modules(
+            cfg, "sample_lib", False
+        )
         assert len(clean_modules) == 1
         assert "ListModule" in str(clean_modules)
         assert "SampleModule" not in str(clean_modules)
 
 
-def test_get_and_filter_modules_respects_included_task_types():
+def test_assert_compatible_raises_if_prev_modules_path_is_not_valid():
     with temp_config(
         {
             "runtime": {
                 "service_generation": {
-                    "task_types": {"included": ["SampleTask"]},
-                }
+                    "backwards_compatibility": {
+                        "enabled": True,
+                        "prev_modules_path": "foobar.json",  # a file that's not valid
+                    }
+                },
             }
-        }
-    ) as cfg:
-        clean_modules = ServicePackageFactory._get_and_filter_modules(cfg, "sample_lib")
-        assert "SampleModule" in str(clean_modules)
-        assert "OtherModule" not in str(clean_modules)
-        # InnerModule has no task
-        assert "InnerModule" not in str(clean_modules)
+        },
+        "merge",
+    ):
+        with pytest.raises(ValueError) as e:
+            ServicePackageFactory.get_service_package(
+                ServicePackageFactory.ServiceType.INFERENCE
+            )
 
 
-def test_get_and_filter_modules_respects_included_task_types_and_excluded_modules():
+def test_assert_compatible_does_not_raise_if_not_enabled():
     with temp_config(
         {
             "runtime": {
                 "service_generation": {
-                    "task_types": {"included": ["SampleTask"]},
-                    "module_guids": {"excluded": [ListModule.MODULE_ID]},
-                }
+                    "backwards_compatibility": {
+                        "enabled": False,
+                    }
+                },
             }
-        }
-    ) as cfg:
-        clean_modules = ServicePackageFactory._get_and_filter_modules(cfg, "sample_lib")
-        assert "SampleModule" in str(clean_modules)
-        assert "ListModule" not in str(clean_modules)
+        },
+        "merge",
+    ):
+        ServicePackageFactory.get_service_package(
+            ServicePackageFactory.ServiceType.INFERENCE
+        )
+
+
+def test_assert_compatible_raises_if_a_module_becomes_unsupported():
+    with tempfile.TemporaryDirectory() as workdir:
+        prev_module_file = os.path.join(workdir, "prev_modules.json")
+        random_uuid = str(uuid.uuid4())
+        with open(prev_module_file, "w", encoding="utf-8") as file:
+            json_content = {
+                "included_modules": {
+                    "SampleTask": {
+                        random_uuid: "<class 'sample_lib.modules.sample_task.sample_implementation.PrevSampleModule'>",
+                    }
+                },
+            }
+            file.write(json.dumps(json_content, indent=4))
+        with temp_config(
+            {
+                "runtime": {
+                    "service_generation": {
+                        "backwards_compatibility": {
+                            "enabled": True,
+                            "prev_modules_path": prev_module_file,
+                        }
+                    },
+                }
+            },
+            "merge",
+        ):
+            with pytest.raises(ValueError):
+                # this raises because PrevSampleModule will not be included in this service generation
+                ServicePackageFactory.get_service_package(
+                    ServicePackageFactory.ServiceType.INFERENCE
+                )
+
+
+def test_assert_compatible_does_not_raise_if_supported_modules_continue_to_be_supported():
+    with tempfile.TemporaryDirectory() as workdir:
+        prev_module_file = os.path.join(workdir, "prev_modules.json")
+
+        with open(prev_module_file, "w", encoding="utf-8") as file:
+            json_content = {
+                "included_modules": {
+                    "SampleTask": {
+                        "00110203-0405-0607-0809-0a0b02dd0e0f": "<class 'sample_lib.modules.sample_task.sample_implementation.SampleModule'>",
+                    }
+                },
+            }
+            file.write(json.dumps(json_content, indent=4))
+        with temp_config(
+            {
+                "runtime": {
+                    "service_generation": {
+                        "backwards_compatibility": {
+                            "enabled": True,
+                            "prev_modules_path": prev_module_file,
+                        }
+                    },
+                }
+            },
+            "merge",
+        ):
+            # this does not raise because SampleModule will be included in this service generation
+            ServicePackageFactory.get_service_package(
+                ServicePackageFactory.ServiceType.INFERENCE
+            )
 
 
 def test_override_domain(clean_data_model):
@@ -250,7 +283,9 @@ def test_override_domain(clean_data_model):
         )
 
         # Just double-check that basics are good.
-        clean_modules = ServicePackageFactory._get_and_filter_modules(cfg, "sample_lib")
+        clean_modules = ServicePackageFactory._get_and_filter_modules(
+            cfg, "sample_lib", False
+        )
         assert "SampleModule" in str(clean_modules)
 
 
@@ -279,7 +314,9 @@ def test_override_package(clean_data_model):
         )
 
         # Just double-check that basics are good.
-        clean_modules = ServicePackageFactory._get_and_filter_modules(cfg, "sample_lib")
+        clean_modules = ServicePackageFactory._get_and_filter_modules(
+            cfg, "sample_lib", False
+        )
         assert "SampleModule" in str(clean_modules)
 
 
@@ -315,7 +352,9 @@ def test_override_package_and_domain_with_proto_gen(clean_data_model):
         )
 
         # Just double-check that basics are good.
-        clean_modules = ServicePackageFactory._get_and_filter_modules(cfg, "sample_lib")
+        clean_modules = ServicePackageFactory._get_and_filter_modules(
+            cfg, "sample_lib", False
+        )
         assert "SampleModule" in str(clean_modules)
 
         # Full check on proto generation
@@ -364,7 +403,7 @@ def test_backend_modules_included_in_service_generation(
     inference_service = ServicePackageFactory.get_service_package(
         ServicePackageFactory.ServiceType.INFERENCE
     )
-    predict_class = get_inference_request(SampleModule.TASK_CLASS)
+    predict_class = get_inference_request(SampleTask)
     sample_task_request = predict_class().to_proto()
 
     # Check that the new parameter defined in this backend module exists in the service
@@ -380,15 +419,13 @@ def test_get_inference_request_throws_wrong_type(runtime_grpc_server):
 def test_get_inference_request(runtime_grpc_server):
     """Test that we are able to get inference request DM with either module or task class"""
     assert get_inference_request(SampleModule).__name__ == "SampleTaskRequest"
-    assert (
-        get_inference_request(SampleModule.TASK_CLASS).__name__ == "SampleTaskRequest"
-    )
+    assert get_inference_request(SampleTask).__name__ == "SampleTaskRequest"
     assert (
         get_inference_request(SampleModule, output_streaming=True).__name__
         == "ServerStreamingSampleTaskRequest"
     )
     assert (
-        get_inference_request(SampleModule.TASK_CLASS, output_streaming=True).__name__
+        get_inference_request(SampleTask, output_streaming=True).__name__
         == "ServerStreamingSampleTaskRequest"
     )
     assert (
@@ -399,7 +436,7 @@ def test_get_inference_request(runtime_grpc_server):
     )
     assert (
         get_inference_request(
-            SampleModule.TASK_CLASS, input_streaming=True, output_streaming=True
+            SampleTask, input_streaming=True, output_streaming=True
         ).__name__
         == "BidiStreamingSampleTaskRequest"
     )
