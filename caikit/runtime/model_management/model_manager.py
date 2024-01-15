@@ -14,11 +14,13 @@
 # Standard
 from collections import Counter as DictCounter
 from functools import partial
-from typing import Dict, Optional
+from pathlib import Path
+from typing import Dict, Optional, Union
 import atexit
 import gc
 import os
 import threading
+import time
 
 # Third Party
 from grpc import StatusCode
@@ -31,11 +33,11 @@ import alog
 from caikit import get_config
 from caikit.core import ModuleBase
 from caikit.core.exceptions import error_handler
+from caikit.core.model_management import ModelFinderBase, ModelInitializerBase
 from caikit.runtime.model_management.loaded_model import LoadedModel
 from caikit.runtime.model_management.model_loader import ModelLoader
 from caikit.runtime.model_management.model_sizer import ModelSizer
 from caikit.runtime.types.caikit_runtime_exception import CaikitRuntimeException
-from caikit.runtime.work_management.abortable_action import ActionAborter
 
 log = alog.use_channel("MODEL-MANAGR")
 error = error_handler.get(log)
@@ -110,11 +112,26 @@ class ModelManager:  # pylint: disable=too-many-instance-attributes
 
         # Keep track of whether lazy loading is enabled
         self._lazy_load_local_models = runtime_cfg.lazy_load_local_models
-        error.value_check(
-            "<RUN44773514E>",
-            not self._lazy_load_local_models or self._local_models_dir,
-            "Must set runtime.local_models_dir with runtime.lazy_load_local_models",
-        )
+
+        if self._lazy_load_local_models:
+            error.value_check(
+                "<RUN44773525E>",
+                runtime_cfg.local_models_dir is not None,
+                (
+                    "runtime.local_models_dir must be set"
+                    " if using runtime.lazy_load_local_models. "
+                ),
+            )
+
+            error.value_check(
+                "<RUN44773514E>",
+                self._local_models_dir,
+                (
+                    "runtime.local_models_dir must be a valid path"
+                    " if set with runtime.lazy_load_local_models. "
+                    f"Provided path: {runtime_cfg.local_models_dir}"
+                ),
+            )
 
         # Set up local model periodic sync
         self._lazy_load_poll_period_seconds = runtime_cfg.lazy_load_poll_period_seconds
@@ -131,13 +148,28 @@ class ModelManager:  # pylint: disable=too-many-instance-attributes
             and self._lazy_load_local_models
             and self._lazy_load_poll_period_seconds
         )
+        self._lazy_load_write_detection_period_seconds = (
+            runtime_cfg.lazy_load_write_detection_period_seconds
+        )
+        error.type_check(
+            "<RUN58138047E>",
+            int,
+            float,
+            allow_none=True,
+            lazy_load_write_detection_period_seconds=self._lazy_load_write_detection_period_seconds,
+        )
         if self._enable_lazy_load_poll:
             atexit.register(self.shut_down)
 
         # Do the initial local models load
         if self._local_models_dir:
-            log.info("<RUN44739400I>", "Loading local models into Caikit Runtime...")
-            self.sync_local_models(wait=True)
+            wait = runtime_cfg.wait_for_initial_model_loads
+            log.info(
+                "<RUN44739400I>",
+                "Loading local models into Caikit Runtime. Wait: %s",
+                wait,
+            )
+            self.sync_local_models(wait=wait)
 
     def shut_down(self):
         """Shut down cache purging"""
@@ -156,19 +188,19 @@ class ModelManager:  # pylint: disable=too-many-instance-attributes
         local_model_path: str,
         model_type: str,
         wait: bool = True,
-        aborter: Optional[ActionAborter] = None,
         retries: Optional[int] = None,
-    ) -> int:
+        finder: Optional[Union[str, ModelFinderBase]] = None,
+        initializer: Optional[Union[str, ModelInitializerBase]] = None,
+    ) -> LoadedModel:
         """Load a model using model_path (in Cloud Object Storage) & give it a model ID
         Args:
             model_id (str):  Model ID string for the model to load.
             local_model_path (str): Local path to load the model from.
             model_type (str): Type of the model to load.
             wait (bool): Wait for the model to finish loading
-            aborter (Optional[ActionAborter]): The aborter to use for this load
-            retries: Optional[int]: Number of times to retry on load failure
+            retries (Optional[int]): Number of times to retry on load failure
         Returns:
-            Model_size (int) : Size of the loaded model in bytes
+            model (LoadedModel): The LoadedModel instance
         """
         with LOAD_MODEL_DURATION_SUMMARY.labels(model_type=model_type).time():
 
@@ -179,7 +211,7 @@ class ModelManager:  # pylint: disable=too-many-instance-attributes
             model = self.loaded_models.get(model_id)
             if model is not None:
                 log.debug("Model '%s' is already loaded", model_id)
-                return model.size()
+                return model
 
             # Grab the mutation lock and load the model if needed
             with self._loaded_models_lock:
@@ -192,9 +224,10 @@ class ModelManager:  # pylint: disable=too-many-instance-attributes
                             model_id,
                             local_model_path,
                             model_type,
-                            aborter=aborter,
                             fail_callback=partial(self.unload_model, model_id),
                             retries=retries,
+                            finder=finder,
+                            initializer=initializer,
                         )
                     except Exception as ex:
                         self.__increment_load_model_exception_count_metric(model_type)
@@ -224,8 +257,8 @@ class ModelManager:  # pylint: disable=too-many-instance-attributes
             if wait:
                 model.wait()
 
-            # Return the model's size
-            return model.size()
+            # Return the loaded model handle
+            return model
 
     def sync_local_models(self, wait: bool = False):
         """Sync in-memory models with models in the configured local_model_dir
@@ -234,7 +267,7 @@ class ModelManager:  # pylint: disable=too-many-instance-attributes
         be unloaded.
 
         Args:
-            wait (bool): Wait for loading to complete
+            wait (bool): After starting all loads, wait for them to complete
         """
         try:
             self._local_models_dir_sync(wait)
@@ -376,8 +409,8 @@ class ModelManager:  # pylint: disable=too-many-instance-attributes
             )
 
         # Now retrieve the model and fall back to lazy loading
-        model_loaded = model_id in self.loaded_models
-        if not model_loaded and self._lazy_load_local_models:
+        loaded_model = self.loaded_models.get(model_id)
+        if not loaded_model and self._lazy_load_local_models:
             local_model_path = os.path.join(self._local_models_dir, model_id)
             log.debug2(
                 "Lazy loading local model %s from %s", model_id, local_model_path
@@ -389,17 +422,16 @@ class ModelManager:  # pylint: disable=too-many-instance-attributes
             if not os.path.exists(local_model_path):
                 log.debug2("Attempting to load ephemeral model %s", model_id)
                 local_model_path = model_id
-            self.load_model(
+            loaded_model = self.load_model(
                 model_id=model_id,
                 local_model_path=local_model_path,
                 model_type=self._LOCAL_MODEL_TYPE,
                 wait=True,
                 retries=get_config().runtime.lazy_load_retries,
             )
-            model_loaded = True
 
         # If still not loaded, there's nothing to find, so raise NOT_FOUND
-        if not model_loaded:
+        if not loaded_model:
             msg = f"Model '{model_id}' not loaded"
             log.debug(
                 {"log_code": "<RUN61105243D>", "message": msg, "model_id": model_id}
@@ -410,7 +442,7 @@ class ModelManager:  # pylint: disable=too-many-instance-attributes
 
         # NOTE: If the model is partially loaded, this call will wait on the
         #   model future in the LoadedModel
-        return self.loaded_models[model_id].model()
+        return loaded_model.model()
 
     ## Implementation Details ##
 
@@ -430,7 +462,13 @@ class ModelManager:  # pylint: disable=too-many-instance-attributes
         try:
             disk_models = os.listdir(self._local_models_dir)
         except FileNotFoundError as err:
+            log.error(
+                "<RUN44739499E>", "Failed to read model ids from disk", exc_info=True
+            )
             raise StopIteration() from err
+
+        log.debug3("All models found in local disk cache: %s", disk_models)
+        log.debug3("Currently loaded models: %s", list(self.loaded_models.keys()))
 
         # Find all models that aren't currently loaded
         new_models = [
@@ -443,16 +481,19 @@ class ModelManager:  # pylint: disable=too-many-instance-attributes
         unload_models = [
             model_id
             for model_id, loaded_model in self.loaded_models.items()
-            if model_id not in disk_models
-            and loaded_model.path().startswith(
-                self._local_models_dir,
-            )
+            if loaded_model.path().startswith(self._local_models_dir)
+            and not os.path.exists(loaded_model.path())
         ]
         log.debug("Unloaded local models: %s", unload_models)
 
         # Load new models
         for model_id in new_models:
             model_path = os.path.join(self._local_models_dir, model_id)
+
+            if self._model_write_in_progress(model_path):
+                log.debug("Model %s is still being written", model_id)
+                continue
+
             self.load_model(
                 model_id,
                 model_path,
@@ -483,13 +524,42 @@ class ModelManager:  # pylint: disable=too-many-instance-attributes
                 try:
                     loaded_model.wait()
                 except CaikitRuntimeException as err:
-                    log.warning(
-                        "<RUN56627485W>",
+                    log.debug(
+                        "<RUN56627485D>",
                         "Failed to load model %s: %s",
                         model_id,
                         repr(err),
                         exc_info=True,
                     )
+
+    def _model_write_in_progress(self, model_dir: str) -> bool:
+        """Returns true if model_dir is currently being written to. Uses the
+        runtime.lazy_load_write_detection_period_seconds configuration to sleep between
+        consecutive size checks of the directory.
+
+        Always returns false if runtime.lazy_load_write_detection_period_seconds is zero,
+        negative, or None.
+        """
+        if (
+            self._lazy_load_write_detection_period_seconds is None
+            or self._lazy_load_write_detection_period_seconds <= 0
+        ):
+            return False
+
+        # Get the current directory size
+        size = self._get_total_disk_size(model_dir)
+        # Sleep a bit to wait out another write
+        time.sleep(self._lazy_load_write_detection_period_seconds)
+        # Get the size again. If it has changed, then a write is currently  in progress
+        return self._get_total_disk_size(model_dir) != size
+
+    @staticmethod
+    def _get_total_disk_size(model_dir: str) -> int:
+        """Returns the sum of st_size of all files contained within the directory structure rooted
+        at model_dir.
+        """
+        dir_path = Path(model_dir)
+        return sum([f.stat().st_size for f in dir_path.rglob("*") if f.is_file()])
 
     def __report_total_model_size_metric(self):
         # Just a happy little lock to ensure that with concurrent loading and unloading,

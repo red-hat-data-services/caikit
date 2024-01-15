@@ -13,7 +13,6 @@
 # limitations under the License.
 """This module is responsible for creating service objects for the runtime to consume"""
 # Standard
-from enum import Enum
 from types import ModuleType
 from typing import Callable, Dict, Set, Type, Union
 import dataclasses
@@ -38,10 +37,22 @@ from caikit.core.data_model.dataobject import _AUTO_GEN_PROTO_CLASSES
 from caikit.core.exceptions import error_handler
 from caikit.core.task import TaskBase
 from caikit.interfaces.runtime.data_model import (
+    ModelInfoRequest,
+    ModelInfoResponse,
+    RuntimeInfoRequest,
+    RuntimeInfoResponse,
     TrainingInfoRequest,
     TrainingStatusResponse,
 )
 from caikit.runtime import service_generation
+from caikit.runtime.names import ServiceType as InterfaceServiceType
+from caikit.runtime.names import (
+    get_service_name,
+    get_service_package_name,
+    get_task_predict_request_name,
+    get_train_parameter_name,
+    get_train_request_name,
+)
 from caikit.runtime.service_generation.rpcs import CaikitRPCBase
 from caikit.runtime.utils import import_util
 
@@ -61,6 +72,24 @@ TRAINING_MANAGEMENT_SERVICE_SPEC = {
                 "name": "CancelTraining",
                 "input_type": TrainingInfoRequest.get_proto_class().DESCRIPTOR.full_name,
                 "output_type": TrainingStatusResponse.get_proto_class().DESCRIPTOR.full_name,
+            },
+        ]
+    }
+}
+
+INFO_SERVICE_NAME = "InfoService"
+INFO_SERVICE_SPEC = {
+    "service": {
+        "rpcs": [
+            {
+                "name": "GetRuntimeInfo",
+                "input_type": RuntimeInfoRequest.get_proto_class().DESCRIPTOR.full_name,
+                "output_type": RuntimeInfoResponse.get_proto_class().DESCRIPTOR.full_name,
+            },
+            {
+                "name": "GetModelsInfo",
+                "input_type": ModelInfoRequest.get_proto_class().DESCRIPTOR.full_name,
+                "output_type": ModelInfoResponse.get_proto_class().DESCRIPTOR.full_name,
             },
         ]
     }
@@ -90,10 +119,7 @@ class ServicePackage:
 class ServicePackageFactory:
     """Factory responsible for yielding the correct concrete ServicePackage implementation"""
 
-    class ServiceType(Enum):
-        INFERENCE = 1  # Inference service for the GlobalPredictServicer
-        TRAINING = 2  # Training service for the GlobalTrainServicer
-        TRAINING_MANAGEMENT = 3
+    ServiceType = InterfaceServiceType
 
     @classmethod
     def get_service_package(
@@ -130,13 +156,28 @@ class ServicePackageFactory:
                 caikit_rpcs={},  # No caikit RPCs
             )
 
+        if service_type == cls.ServiceType.INFO:
+            grpc_service = json_to_service(
+                name=INFO_SERVICE_NAME,
+                package="caikit.runtime.info",
+                json_service_def=INFO_SERVICE_SPEC,
+            )
+
+            return ServicePackage(
+                service=grpc_service.service_class,
+                descriptor=grpc_service.descriptor,
+                registration_function=grpc_service.registration_function,
+                stub_class=grpc_service.client_stub_class,
+                messages=None,  # we don't need messages here
+                caikit_rpcs={},  # No caikit RPCs
+            )
+
         # First make sure we import the data model for the correct library
         # !!!! This will use the `caikit_library` config
         _ = import_util.get_data_model()
 
         # Get the names for the AI domain and the proto package
-        ai_domain_name = service_generation.get_ai_domain()
-        package_name = service_generation.get_runtime_service_package()
+        package_name = get_service_package_name(service_type)
 
         # Then do API introspection to come up with all the API definitions to support
         caikit_config = get_config()
@@ -144,6 +185,7 @@ class ServicePackageFactory:
             caikit_config, caikit_config.runtime.library, write_modules_file
         )
 
+        service_name = get_service_name(service_type)
         if service_type == cls.ServiceType.INFERENCE:
             # Assert for backwards compatibility, if enabled, when service type is INFERENCE
             ServicePackageFactory._check_backwards_compatibility(
@@ -153,10 +195,8 @@ class ServicePackageFactory:
             rpc_list = service_generation.create_inference_rpcs(
                 clean_modules, caikit_config
             )
-            service_name = f"{ai_domain_name}Service"
         else:  # service_type == cls.ServiceType.TRAINING
             rpc_list = service_generation.create_training_rpcs(clean_modules)
-            service_name = f"{ai_domain_name}TrainingService"
 
         rpc_list = [rpc for rpc in rpc_list if rpc.return_type is not None]
 
@@ -204,7 +244,7 @@ class ServicePackageFactory:
                 "prev_modules_path {} is not a valid file path or is missing permissions",
                 prev_modules_path,
             )
-            with open(prev_modules_path, "r", encoding="utf-8") as f:
+            with open(prev_modules_path, encoding="utf-8") as f:
                 previous_modules = json.load(f)
                 previous_included_task_map = previous_modules["included_modules"]
                 for task_module in previous_included_task_map.values():
@@ -318,20 +358,12 @@ def get_inference_request(
         ModuleBase,
         TaskBase,
     )
-    task_class = (
-        next(iter(task_or_module_class.tasks))
-        if issubclass(task_or_module_class, ModuleBase)
-        else task_or_module_class
-    )
 
-    if input_streaming and output_streaming:
-        request_class_name = f"BidiStreaming{task_class.__name__}Request"
-    elif input_streaming:
-        request_class_name = f"ClientStreaming{task_class.__name__}Request"
-    elif output_streaming:
-        request_class_name = f"ServerStreaming{task_class.__name__}Request"
-    else:
-        request_class_name = f"{task_class.__name__}Request"
+    request_class_name = get_task_predict_request_name(
+        task_or_module_class,
+        input_streaming=input_streaming,
+        output_streaming=output_streaming,
+    )
     log.debug(
         "Request class name %s for class %s.", request_class_name, task_or_module_class
     )
@@ -345,10 +377,7 @@ def get_train_request(module_class: Type[ModuleBase]) -> Type[DataBase]:
         module_class,
         ModuleBase,
     )
-    # 🌶️🌶️🌶️ This is coupled to the naming scheme code in
-    # caikit.runtime.service_generation.rpcs, which is likely to change.
-    first_task = next(iter(module_class.tasks))
-    request_class_name = f"{first_task.__name__}{module_class.__name__}TrainRequest"
+    request_class_name = get_train_request_name(module_class)
     log.debug("Request class name %s for module %s.", request_class_name, module_class)
     return DataBase.get_class_for_name(request_class_name)
 
@@ -360,8 +389,7 @@ def get_train_params(module_class: Type[ModuleBase]) -> Type[DataBase]:
         module_class,
         ModuleBase,
     )
-    first_task = next(iter(module_class.tasks))
 
-    request_class_name = f"{first_task.__name__}{module_class.__name__}TrainParameters"
+    request_class_name = get_train_parameter_name(module_class)
     log.debug("Request class name %s for module %s.", request_class_name, module_class)
     return DataBase.get_class_for_name(request_class_name)

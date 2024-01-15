@@ -11,6 +11,11 @@ import zipfile
 # Local
 from caikit.core import DataObjectBase, TaskBase, dataobject, task
 from caikit.core.data_model import ProducerId
+from caikit.core.data_model.json_dict import JsonDict
+from caikit.core.exceptions.caikit_core_exception import (
+    CaikitCoreException,
+    CaikitCoreStatusCode,
+)
 from caikit.interfaces.common.data_model import File
 
 
@@ -29,12 +34,31 @@ class SampleListInputType(DataObjectBase):
     inputs: List[SampleInputType]
 
 
+# Test w/ just import and no dataobject
+@dataobject(package="caikit_data_model.sample_lib")
+class JsonDictInputType(DataObjectBase):
+    """A sample `JsonDict` input type for this library.
+
+    This exists because it impacts test_json_dict.py testing under proto3.
+    This class is not used, but it affects the descriptor pool behavior.
+    """
+
+    jd: JsonDict
+
+
 @dataobject(package="caikit_data_model.sample_lib")
 class FileInputType(DataObjectBase):
     """A simple type for tasks that deal with file data"""
 
     file: File
     metadata: SampleInputType
+
+    def __post_init__(self):
+        if self.file.filename and ".exe" in self.file.filename:
+            raise CaikitCoreException(
+                status_code=CaikitCoreStatusCode.INVALID_ARGUMENT,
+                message="Executables are not a supported File type",
+            )
 
 
 @dataobject(package="caikit_data_model.sample_lib")

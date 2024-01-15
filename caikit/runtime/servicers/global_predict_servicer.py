@@ -29,11 +29,12 @@ import alog
 
 # Local
 from caikit import get_config
-from caikit.core import ModuleBase
+from caikit.core import ModuleBase, TaskBase
 from caikit.core.data_model import DataBase, DataStream
 from caikit.core.signature_parsing import CaikitMethodSignature
 from caikit.runtime.metrics.rpc_meter import RPCMeter
 from caikit.runtime.model_management.model_manager import ModelManager
+from caikit.runtime.names import MODEL_MESH_MODEL_ID_KEY
 from caikit.runtime.service_factory import ServicePackage
 from caikit.runtime.service_generation.rpcs import TaskPredictRPC
 from caikit.runtime.types.caikit_runtime_exception import CaikitRuntimeException
@@ -45,7 +46,10 @@ from caikit.runtime.utils.servicer_util import (
     get_metadata,
     validate_data_model,
 )
-from caikit.runtime.work_management.abortable_action import AbortableAction
+from caikit.runtime.work_management.abortable_context import (
+    AbortableContext,
+    ThreadInterrupter,
+)
 from caikit.runtime.work_management.rpc_aborter import RpcAborter
 
 PREDICT_RPC_COUNTER = Counter(
@@ -84,16 +88,13 @@ class GlobalPredictServicer:
     given request
     """
 
-    # Invocation metadata key for the model ID, provided by Model Mesh
-    MODEL_MESH_MODEL_ID_KEY = "mm-model-id"
-
     # Input size in code points, provided by orchestrator
     INPUT_SIZE_KEY = "input-length"
 
     def __init__(
         self,
         inference_service: ServicePackage,
-        use_abortable_threads: bool = get_config().runtime.use_abortable_threads,
+        interrupter: ThreadInterrupter = None,
     ):
         self._started_metering = False
         self._model_manager = ModelManager.get_instance()
@@ -111,7 +112,7 @@ class GlobalPredictServicer:
                 "Metering is disabled, to enable set `metering.enabled` in config to true",
             )
 
-        self.use_abortable_threads = use_abortable_threads
+        self._interrupter = interrupter
         self._inference_service = inference_service
         # Validate that the Caikit Library CDM is compatible with our service descriptor
         validate_data_model(self._inference_service.descriptor)
@@ -155,70 +156,72 @@ class GlobalPredictServicer:
                 A Caikit Library data model response object
         """
         # Make sure the request has a model before doing anything
-        model_id = get_metadata(context, self.MODEL_MESH_MODEL_ID_KEY)
+        model_id = get_metadata(context, MODEL_MESH_MODEL_ID_KEY)
         request_name = caikit_rpc.request.name
 
-        with self._handle_predict_exceptions(model_id, request_name):
-            with alog.ContextLog(
-                log.debug, "GlobalPredictServicer.Predict:%s", request_name
-            ):
-                # Retrieve the model from the model manager
-                log.debug("<RUN52259029D>", "Retrieving model '%s'", model_id)
-                model = self._model_manager.retrieve_model(model_id)
-                model_class = type(model)
+        with self._handle_predict_exceptions(model_id, request_name), alog.ContextLog(
+            log.debug, "GlobalPredictServicer.Predict:%s", request_name
+        ):
+            # Retrieve the model from the model manager
+            log.debug("<RUN52259029D>", "Retrieving model '%s'", model_id)
+            model = self._model_manager.retrieve_model(model_id)
+            model_class = type(model)
 
-                # Little hackity hack: Calling _verify_model_task upfront here as well to
-                # short-circuit requests where the model is _totally_ unsupported
-                self._verify_model_task(model)
+            # Little hackity hack: Calling _verify_model_task upfront here as well to
+            # short-circuit requests where the model is _totally_ unsupported
+            self._verify_model_task(model)
 
-                # Unmarshall the request object into the required module run argument(s)
-                with PREDICT_FROM_PROTO_SUMMARY.labels(
-                    grpc_request=request_name, model_id=model_id
-                ).time():
-                    inference_signature = model_class.get_inference_signature(
-                        input_streaming=caikit_rpc.input_streaming,
-                        output_streaming=caikit_rpc.output_streaming,
-                        task=caikit_rpc.task,
-                    )
-                    if not inference_signature:
-                        raise CaikitRuntimeException(
-                            StatusCode.INVALID_ARGUMENT,
-                            f"Model class {model_class} does not support {caikit_rpc.name}",
-                        )
-                    if caikit_rpc.input_streaming:
-                        caikit_library_request = (
-                            self._build_caikit_library_request_stream(
-                                request, inference_signature, caikit_rpc
-                            )
-                        )
-                    else:
-                        caikit_library_request = build_caikit_library_request_dict(
-                            request,
-                            inference_signature,
-                        )
-                response = self.predict_model(
-                    request_name,
-                    model_id,
-                    inference_func_name=inference_signature.method_name,
-                    aborter=RpcAborter(context) if self.use_abortable_threads else None,
-                    **caikit_library_request,
+            # Unmarshall the request object into the required module run argument(s)
+            with PREDICT_FROM_PROTO_SUMMARY.labels(
+                grpc_request=request_name, model_id=model_id
+            ).time():
+                inference_signature = model_class.get_inference_signature(
+                    input_streaming=caikit_rpc.input_streaming,
+                    output_streaming=caikit_rpc.output_streaming,
+                    task=caikit_rpc.task,
                 )
+                if not inference_signature:
+                    raise CaikitRuntimeException(
+                        StatusCode.INVALID_ARGUMENT,
+                        f"Model class {model_class} does not support {caikit_rpc.name}",
+                    )
+                if caikit_rpc.input_streaming:
+                    caikit_library_request = self._build_caikit_library_request_stream(
+                        request, inference_signature, caikit_rpc
+                    )
+                else:
+                    caikit_library_request = build_caikit_library_request_dict(
+                        request,
+                        inference_signature,
+                    )
+            response = self.predict_model(
+                request_name,
+                model_id,
+                input_streaming=caikit_rpc.input_streaming,
+                output_streaming=caikit_rpc.output_streaming,
+                task=caikit_rpc.task,
+                aborter=RpcAborter(context) if self._interrupter else None,
+                **caikit_library_request,
+            )
 
-                # Marshall the response to the necessary return type
-                with PREDICT_TO_PROTO_SUMMARY.labels(
-                    grpc_request=request_name, model_id=model_id
-                ).time():
-                    if caikit_rpc.output_streaming:
-                        response_proto = build_proto_stream(response)
-                    else:
-                        response_proto = build_proto_response(response)
-                return response_proto
+            # Marshall the response to the necessary return type
+            with PREDICT_TO_PROTO_SUMMARY.labels(
+                grpc_request=request_name, model_id=model_id
+            ).time():
+                if caikit_rpc.output_streaming:
+                    response_proto = build_proto_stream(response)
+                else:
+                    response_proto = build_proto_response(response)
+            return response_proto
 
     def predict_model(
         self,
         request_name: str,
         model_id: str,
         inference_func_name: str = "run",
+        input_streaming: Optional[bool] = None,
+        output_streaming: Optional[bool] = None,
+        task: Optional[TaskBase] = None,
         aborter: Optional[RpcAborter] = None,
         **kwargs,
     ) -> Union[DataBase, Iterable[DataBase]]:
@@ -231,7 +234,14 @@ class GlobalPredictServicer:
             model_id (str):
                 The ID of the loaded model
             inference_func_name (str):
-                The name of the inference function to run
+                Explicit name of the inference function to predict (ignored if
+                input_streaming and output_streaming set)
+            input_streaming (Optional[bool]):
+                Use the task function with input streaming
+            output_streaming (Optional[bool]):
+                Use the task function with output streaming
+            task (Optional[TaskBase])
+                The task to use for inference (if multitask model)
             aborter (Optional[RpcAborter]):
                 If using abortable calls, this is the aborter to use
             **kwargs: Keyword arguments to pass to the model's run function
@@ -244,23 +254,29 @@ class GlobalPredictServicer:
         with self._handle_predict_exceptions(model_id, request_name):
             model = self._model_manager.retrieve_model(model_id)
             self._verify_model_task(model)
+            if input_streaming is not None and output_streaming is not None:
+                inference_func_name = model.get_inference_signature(
+                    output_streaming=output_streaming,
+                    input_streaming=input_streaming,
+                    task=task,
+                ).method_name
+                log.debug2("Deduced inference function name: %s", inference_func_name)
 
+            model_run_fn = getattr(model, inference_func_name)
             # NB: we previously recorded the size of the request, and timed this module to
             # provide a rudimentary throughput metric of size / time
+            # 🌶️🌶️🌶️ The `AbortableContext` will only abort if both `self._interrupter` and
+            # `aborter` are set
             with alog.ContextLog(
                 log.debug,
                 "GlobalPredictServicer.Predict.caikit_library_run:%s",
                 request_name,
+            ), PREDICT_CAIKIT_LIBRARY_SUMMARY.labels(
+                grpc_request=request_name, model_id=model_id
+            ).time(), AbortableContext(
+                aborter, self._interrupter
             ):
-                model_run_fn = getattr(model, inference_func_name)
-                with PREDICT_CAIKIT_LIBRARY_SUMMARY.labels(
-                    grpc_request=request_name, model_id=model_id
-                ).time():
-                    if aborter is not None:
-                        work = AbortableAction(aborter, model_run_fn, **kwargs)
-                        response = work.do()
-                    else:
-                        response = model_run_fn(**kwargs)
+                response = model_run_fn(**kwargs)
 
             # Update Prometheus metrics
             PREDICT_RPC_COUNTER.labels(
@@ -391,7 +407,7 @@ class GlobalPredictServicer:
         )
         stream_num += 1
 
-        for param in streaming_params.keys():
+        for param in streaming_params:
             # For each "streaming" parameter, grab one of the tee'd streams and map it to return
             # a `DataStream` of that individual parameter
 
