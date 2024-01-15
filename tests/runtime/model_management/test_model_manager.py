@@ -16,6 +16,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from functools import partial
 from tempfile import TemporaryDirectory
+from typing import Optional
 from unittest.mock import MagicMock, patch
 import os
 import shutil
@@ -26,14 +27,21 @@ import time
 import grpc
 import pytest
 
+# First Party
+from aconfig.aconfig import Config
+import aconfig
+
 # Local
 from caikit import get_config
+from caikit.core.model_management import ModelFinderBase
+from caikit.core.model_management.local_model_initializer import LocalModelInitializer
 from caikit.core.model_manager import ModelManager as CoreModelManager
-from caikit.core.modules import ModuleBase
+from caikit.core.modules import ModuleBase, ModuleConfig
 from caikit.runtime.model_management.loaded_model import LoadedModel
 from caikit.runtime.model_management.model_manager import ModelManager
 from caikit.runtime.types.caikit_runtime_exception import CaikitRuntimeException
 from caikit.runtime.utils.import_util import get_dynamic_module
+from sample_lib.data_model import SampleInputType
 from tests.conftest import TempFailWrapper, random_test_id, temp_config
 from tests.core.helpers import TestFinder
 from tests.fixtures import Fixtures
@@ -110,7 +118,7 @@ def test_load_model_ok_response():
         model_id=model_id,
         local_model_path=Fixtures.get_good_model_path(),
         model_type=Fixtures.get_good_model_type(),
-    )
+    ).size()
     assert model_size > 0
 
 
@@ -127,7 +135,7 @@ def test_load_model_no_size_update():
         model_id=model_id,
         local_model_path=Fixtures.get_good_model_path(),
         model_type=Fixtures.get_good_model_type(),
-    )
+    ).size()
     assert model_size > 0
     loaded_model = MODEL_MANAGER.loaded_models[model_id]
     assert loaded_model.size() == model_size
@@ -151,7 +159,8 @@ def test_load_local_models():
         assert "model-does-not-exist.zip" not in MODEL_MANAGER.loaded_models.keys()
 
 
-def test_model_manager_loads_local_models_on_init():
+@pytest.mark.parametrize("wait", [True, False])
+def test_model_manager_loads_local_models_on_init(wait):
     with TemporaryDirectory() as tempdir:
         shutil.copytree(Fixtures.get_good_model_path(), os.path.join(tempdir, "model1"))
         shutil.copy(
@@ -160,7 +169,13 @@ def test_model_manager_loads_local_models_on_init():
         )
         ModelManager._ModelManager__instance = None
         with temp_config(
-            {"runtime": {"local_models_dir": tempdir}}, merge_strategy="merge"
+            {
+                "runtime": {
+                    "local_models_dir": tempdir,
+                    "wait_for_initial_model_loads": wait,
+                },
+            },
+            merge_strategy="merge",
         ):
             MODEL_MANAGER = ModelManager()
 
@@ -168,6 +183,11 @@ def test_model_manager_loads_local_models_on_init():
             assert "model1" in MODEL_MANAGER.loaded_models.keys()
             assert "model2.zip" in MODEL_MANAGER.loaded_models.keys()
             assert "model-does-not-exist.zip" not in MODEL_MANAGER.loaded_models.keys()
+
+            # Make sure that the loaded model can be retrieved and run
+            for model_name in ["model1", "model2.zip"]:
+                model = MODEL_MANAGER.retrieve_model(model_name)
+                model.run(SampleInputType("hello"))
 
 
 def test_load_model_error_response():
@@ -434,7 +454,7 @@ def test_model_manager_disk_caching_periodic_sync(good_model_path):
     """Make sure that when using disk caching, the manager periodically syncs
     its loaded models based on their presence in the cache
     """
-    purge_period = 0.001
+    purge_period = 0.002
     with TemporaryDirectory() as cache_dir:
         with non_singleton_model_managers(
             2,
@@ -483,6 +503,142 @@ def test_model_manager_disk_caching_periodic_sync(good_model_path):
                 if mgr_one_unloaded and mgr_two_unloaded:
                     break
             assert mgr_one_unloaded and mgr_two_unloaded
+
+
+def test_lazy_load_of_large_model(good_model_path):
+    """Test that a large model that is actively being written to disk is not incorrectly loaded
+    too soon by the lazy loading poll
+    """
+    with TemporaryDirectory() as cache_dir:
+        with non_singleton_model_managers(
+            1,
+            {
+                "runtime": {
+                    "local_models_dir": cache_dir,
+                    "lazy_load_local_models": True,
+                    "lazy_load_poll_period_seconds": 0,
+                },
+            },
+            "merge",
+        ) as managers:
+            manager = managers[0]
+
+            # Start with a valid model
+            model_name = os.path.basename(good_model_path)
+            model_cache_path = os.path.join(cache_dir, model_name)
+            assert not os.path.exists(model_cache_path)
+            shutil.copytree(good_model_path, model_cache_path)
+
+            # Then kick off a thread that will start writing a large file inside this model dir.
+            # This simulates uploading a large model artifact
+            def write_big_file(path: str, stop_event: threading.Event):
+                big_file = os.path.join(path, "big_model_artifact.txt")
+                with open(big_file, "w") as bf:
+                    while not stop_event.is_set():
+                        bf.write("This is a big file\n" * 1000)
+
+            stop_write_event = threading.Event()
+            writer_thread = threading.Thread(
+                target=write_big_file, args=(model_cache_path, stop_write_event)
+            )
+            writer_thread.start()
+
+            try:
+                # Trigger the periodic sync and make sure the model is NOT loaded
+                assert model_name not in manager.loaded_models
+                manager.sync_local_models(wait=True)
+                assert model_name not in manager.loaded_models
+
+                # Stop the model writing thread (Finish the model upload)
+                stop_write_event.set()
+                writer_thread.join()
+
+                # Re-trigger the sync and make sure the model is loaded this time
+                manager.sync_local_models(wait=True)
+                assert model_name in manager.loaded_models
+
+            finally:
+                stop_write_event.set()
+                writer_thread.join()
+
+
+def test_nested_local_model_load_unload(good_model_path):
+    """Test that a model can be loaded in a subdirectory of the local_models_dir
+    and that the periodic sync does not unload the model.
+    """
+    with TemporaryDirectory() as cache_dir:
+        with non_singleton_model_managers(
+            1,
+            {
+                "runtime": {
+                    "local_models_dir": cache_dir,
+                    "lazy_load_local_models": True,
+                    "lazy_load_poll_period_seconds": 0,
+                },
+            },
+            "merge",
+        ) as managers:
+            manager = managers[0]
+
+            # Copy the model into a nested model directory
+            model_name = os.path.join("parent", os.path.basename(good_model_path))
+            model_cache_path = os.path.join(cache_dir, model_name)
+            assert not os.path.exists(model_cache_path)
+            shutil.copytree(good_model_path, model_cache_path)
+
+            # Trigger the periodic sync and make sure the model is NOT loaded
+            assert model_name not in manager.loaded_models
+            manager.sync_local_models(wait=True)
+            assert model_name not in manager.loaded_models
+
+            # Explicitly ask to load the nested model name to trigger the lazy
+            # load
+            model = manager.retrieve_model(model_name)
+            assert model
+            assert model_name in manager.loaded_models
+
+            # Re-trigger the sync and make sure the model does not get unloaded
+            manager.sync_local_models(wait=True)
+            assert model_name in manager.loaded_models
+
+
+def test_model_unload_race(good_model_path):
+    """Test that if a model gets unloaded _while_ it's actively being loaded
+    (before retrieve_model completes, but after load_model completes), no
+    exception is raised.
+    """
+    with TemporaryDirectory() as cache_dir:
+        with non_singleton_model_managers(
+            1,
+            {
+                "runtime": {
+                    "local_models_dir": cache_dir,
+                    "lazy_load_local_models": True,
+                    "lazy_load_poll_period_seconds": 0,
+                },
+            },
+            "merge",
+        ) as managers:
+            manager = managers[0]
+
+            # Copy the model to the local_models_dir
+            model_id = random_test_id()
+            model_cache_path = os.path.join(cache_dir, model_id)
+            shutil.copytree(good_model_path, model_cache_path)
+
+            # Patch the manager's load_model to immediately unload the model
+            orig_load_model = manager.load_model
+
+            def load_and_unload_model(self, model_id: str, *args, **kwargs):
+                res = orig_load_model(model_id, *args, **kwargs)
+                manager.unload_model(model_id)
+                return res
+
+            with patch.object(manager.__class__, "load_model", load_and_unload_model):
+
+                # Retrieve the model and make sure there's no error
+                assert manager.retrieve_model(model_id)
+                assert model_id not in manager.loaded_models
 
 
 def test_load_local_model_deleted_dir():
@@ -590,7 +746,7 @@ def test_load_model():
 
             model_size = MODEL_MANAGER.load_model(
                 model_id, ANY_MODEL_PATH, ANY_MODEL_TYPE
-            )
+            ).size()
             assert expected_model_size == model_size
             mock_loader.load_model.assert_called_once()
             call_args = mock_loader.load_model.call_args
@@ -599,7 +755,6 @@ def test_load_model():
                 ANY_MODEL_PATH,
                 ANY_MODEL_TYPE,
             )
-            assert call_args.kwargs["aborter"] is None
             assert "fail_callback" in call_args.kwargs
             mock_sizer.get_model_size.assert_called_once_with(
                 model_id, ANY_MODEL_PATH, ANY_MODEL_TYPE
@@ -754,12 +909,12 @@ def test_reload_partially_loaded():
             mock_loader.load_model.return_value = loaded_model
             model_size = MODEL_MANAGER.load_model(
                 model_id, ANY_MODEL_PATH, ANY_MODEL_TYPE, wait=False
-            )
+            ).size()
             assert model_size == special_model_size
             assert (
                 MODEL_MANAGER.load_model(
                     model_id, ANY_MODEL_PATH, ANY_MODEL_TYPE, wait=False
-                )
+                ).size()
                 == special_model_size
             )
 
@@ -918,3 +1073,177 @@ def test_lazy_load_handles_temporary_errors():
                 assert manager._lazy_sync_timer is None
                 model = manager.retrieve_model(model_name)
                 assert model
+
+
+def test_lazy_load_true_local_models_dir_valid():
+    """When lazy_load_local_models is True and local_models_dir exists.
+    Check that the local_models_dir is pointing to the correct location
+    """
+
+    with TemporaryDirectory() as cache_dir:
+
+        ModelManager._ModelManager__instance = None
+        with temp_config(
+            {
+                "runtime": {
+                    "local_models_dir": cache_dir,
+                    "lazy_load_local_models": True,
+                }
+            },
+            merge_strategy="merge",
+        ):
+            MODEL_MANAGER = ModelManager()
+            assert len(MODEL_MANAGER.loaded_models) == 0
+            assert MODEL_MANAGER._local_models_dir == cache_dir
+
+
+def test_lazy_load_true_local_models_dir_invalid():
+    """When lazy_load_local_models is True and local_models_dir does not exist.
+    Raise ValueError with an appropriate message
+    """
+
+    with TemporaryDirectory() as cache_dir:
+
+        with pytest.raises(
+            ValueError,
+            match=(
+                "runtime.local_models_dir must be a valid path"
+                " if set with runtime.lazy_load_local_models. "
+                "Provided path: invalid"
+            ),
+        ):
+
+            ModelManager._ModelManager__instance = None
+            with temp_config(
+                {
+                    "runtime": {
+                        "local_models_dir": "invalid",
+                        "lazy_load_local_models": True,
+                    }
+                },
+                merge_strategy="merge",
+            ):
+                MODEL_MANAGER = ModelManager()
+
+
+def test_lazy_load_true_local_models_dir_none():
+    """When lazy_load_local_models is True and local_models_dir is not set in the config.
+    Raise ValueError with an appropriate message
+    """
+
+    with TemporaryDirectory() as cache_dir:
+
+        with pytest.raises(
+            ValueError,
+            match=(
+                "runtime.local_models_dir must be set"
+                " if using runtime.lazy_load_local_models. "
+            ),
+        ):
+
+            ModelManager._ModelManager__instance = None
+            with temp_config(
+                {
+                    "runtime": {
+                        "local_models_dir": None,
+                        "lazy_load_local_models": True,
+                    }
+                },
+                merge_strategy="merge",
+            ):
+                MODEL_MANAGER = ModelManager()
+
+
+def test_lazy_load_false_local_models_dir_valid():
+    """When lazy_load_local_models is False and local_models_dir exists.
+    Check that the local_models_dir is pointing to the correct location
+    """
+
+    with TemporaryDirectory() as cache_dir:
+
+        ModelManager._ModelManager__instance = None
+        with temp_config(
+            {
+                "runtime": {
+                    "local_models_dir": cache_dir,
+                    "lazy_load_local_models": False,
+                }
+            },
+            merge_strategy="merge",
+        ):
+            MODEL_MANAGER = ModelManager()
+            assert len(MODEL_MANAGER.loaded_models) == 0
+            assert MODEL_MANAGER._local_models_dir == cache_dir
+
+
+def test_lazy_load_false_local_models_dir_invalid():
+    """When lazy_load_local_models is False and local_models_dir does not exist.
+    Check that the local_models_dir is False / Empty
+    """
+
+    with TemporaryDirectory() as cache_dir:
+
+        ModelManager._ModelManager__instance = None
+        with temp_config(
+            {
+                "runtime": {
+                    "local_models_dir": "",
+                    "lazy_load_local_models": False,
+                }
+            },
+            merge_strategy="merge",
+        ):
+            MODEL_MANAGER = ModelManager()
+            assert len(MODEL_MANAGER.loaded_models) == 0
+            assert not MODEL_MANAGER._local_models_dir
+
+
+class NoModelFinder(ModelFinderBase):
+    name = "NOMODEL"
+
+    def __init__(self, config: Config, instance_name: str):
+        super().__init__(config, instance_name)
+
+    def find_model(self, model_path: str, **kwargs) -> ModuleConfig:
+        raise FileNotFoundError(f"Unable to find model {model_path}")
+
+
+def test_load_model_custom_finder():
+    """Test to ensure loading model works with custom finder"""
+    bad_finder = NoModelFinder(aconfig.Config({}), "bad_instance")
+
+    model_id = random_test_id()
+    with pytest.raises(CaikitRuntimeException) as exp:
+        MODEL_MANAGER.load_model(
+            model_id=model_id,
+            local_model_path=Fixtures.get_good_model_path(),
+            model_type=Fixtures.get_good_model_type(),
+            finder=bad_finder,
+        )
+    assert exp.value.status_code == grpc.StatusCode.NOT_FOUND
+
+
+class CustomParamInitializer(LocalModelInitializer):
+    name = "CUSTOMPARAM"
+
+    def init(self, model_config: ModuleConfig, **kwargs) -> ModuleBase:
+        module = super().init(model_config, **kwargs)
+        module.custom_param = True
+        return module
+
+
+def test_load_model_custom_initializer():
+    """Test to ensure loading model works with custom initializer"""
+
+    custom_param_initializer = CustomParamInitializer(
+        aconfig.Config({}), "custom_param"
+    )
+    model_id = random_test_id()
+    model = MODEL_MANAGER.load_model(
+        model_id=model_id,
+        local_model_path=Fixtures.get_good_model_path(),
+        model_type=Fixtures.get_good_model_type(),
+        initializer=custom_param_initializer,
+    ).model()
+    assert model
+    assert model.custom_param

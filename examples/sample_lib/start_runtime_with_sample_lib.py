@@ -28,6 +28,9 @@ if __name__ == "__main__":
                         "grpc": {"enabled": True},
                         "http": {"enabled": True},
                         "training": {"save_with_id": False, "output_dir": workdir},
+                        "service_generation": {
+                            "package": "caikit_sample_lib"
+                        },  # This is done to avoid name collision with Caikit itself
                     },
                 }
             )
@@ -39,7 +42,7 @@ if __name__ == "__main__":
             # dump protos
             shutil.rmtree("protos", ignore_errors=True)
             if get_config().runtime.grpc.enabled:
-                dump_grpc_services("protos")
+                dump_grpc_services("protos", True)
             if get_config().runtime.http.enabled:
                 dump_http_services("protos")
 

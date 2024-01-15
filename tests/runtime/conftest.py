@@ -14,6 +14,7 @@ import sys
 import tempfile
 import threading
 import time
+import warnings
 
 # Third Party
 from grpc_health.v1 import health_pb2, health_pb2_grpc
@@ -35,6 +36,8 @@ from caikit.runtime.service_factory import ServicePackage, ServicePackageFactory
 from caikit.runtime.service_generation.rpcs import TaskPredictRPC
 from caikit.runtime.servicers.global_predict_servicer import GlobalPredictServicer
 from caikit.runtime.servicers.global_train_servicer import GlobalTrainServicer
+from caikit.runtime.servicers.model_runtime_servicer import ModelRuntimeServicerImpl
+from caikit.runtime.work_management.abortable_context import ThreadInterrupter
 from tests.conftest import random_test_id, temp_config
 from tests.fixtures import Fixtures
 
@@ -68,10 +71,9 @@ def http_session_scoped_open_port():
     return _open_port()
 
 
-def _open_port():
+def _open_port(start=8888):
     # TODO: This has obvious problems where the port returned for use by a test is not immediately
     # put into use, so parallel tests could attempt to use the same port.
-    start = 8888
     end = start + 1000
     host = "localhost"
     for port in range(start, end):
@@ -98,13 +100,18 @@ def sample_inference_service(render_protos) -> ServicePackage:
 
 @pytest.fixture(scope="session")
 def sample_predict_servicer(sample_inference_service) -> GlobalPredictServicer:
-    servicer = GlobalPredictServicer(inference_service=sample_inference_service)
+    interrupter = ThreadInterrupter()
+    interrupter.start()
+    servicer = GlobalPredictServicer(
+        inference_service=sample_inference_service, interrupter=interrupter
+    )
     yield servicer
     # Make sure to not leave the rpc_meter hanging
     # (It does try to clean itself up on destruction, but just to be sure)
     rpc_meter = getattr(servicer, "rpc_meter", None)
     if rpc_meter:
         rpc_meter.end_writer_thread()
+    interrupter.stop()
 
 
 @pytest.fixture(scope="session")
@@ -151,14 +158,18 @@ def runtime_grpc_test_server(open_port, *args, **kwargs):
 
 
 @pytest.fixture(scope="session")
-def runtime_grpc_server(
-    session_scoped_open_port,
-) -> RuntimeGRPCServer:
+def runtime_grpc_server(session_scoped_open_port) -> RuntimeGRPCServer:
     with runtime_grpc_test_server(
         session_scoped_open_port,
     ) as server:
         _check_server_readiness(server)
         yield server
+
+
+@pytest.fixture(scope="session")
+def model_runtime_servicer(runtime_grpc_server) -> ModelRuntimeServicerImpl:
+    # Builds a new servicer, the one in the server is a bit hard to access
+    return ModelRuntimeServicerImpl(interrupter=runtime_grpc_server.interrupter)
 
 
 @contextmanager
@@ -179,12 +190,18 @@ def runtime_http_test_server(open_port, *args, **kwargs):
             },
             "merge",
         ):
-            config_overrides = {}
-            if "tls_config_override" in kwargs:
-                config_overrides = kwargs["tls_config_override"]
-                kwargs["tls_config_override"] = config_overrides["runtime"]["tls"]
+            # Forward the special "tls_config_override" to "tls_config_override"
+            # IFF the configs contain actual TLS (indicated by the presence of
+            # the special "use_in_test" element).
+            config_overrides = kwargs.pop("tls_config_override", {})
+            if tls_config_override := config_overrides.get("runtime", {}).get("tls"):
+                kwargs["tls_config_override"] = tls_config_override
+            else:
+                config_overrides = {}
+            check_readiness = kwargs.pop("check_readiness", True)
             with http_server.RuntimeHTTPServer(*args, **kwargs) as server:
-                _check_http_server_readiness(server, config_overrides)
+                if check_readiness:
+                    _check_http_server_readiness(server, config_overrides)
                 # Give tests access to the workdir
                 server.workdir = workdir
                 yield server
@@ -259,6 +276,23 @@ def file_task_model_id(box_model_path) -> str:
     model_manager.load_model(
         model_id,
         local_model_path=box_model_path,
+        model_type=Fixtures.get_good_model_type(),  # eventually we'd like to be determining the type from the model itself...
+    )
+    yield model_id
+
+    # teardown
+    model_manager.unload_model(model_id)
+
+
+@pytest.fixture
+def primitive_task_model_id(primitive_model_path) -> str:
+    """Loaded model ID using model manager load model implementation"""
+    model_id = random_test_id()
+    model_manager = ModelManager.get_instance()
+    # model load test already tests with archive - just using a model path here
+    model_manager.load_model(
+        model_id,
+        local_model_path=primitive_model_path,
         model_type=Fixtures.get_good_model_type(),  # eventually we'd like to be determining the type from the model itself...
     )
     yield model_id
@@ -383,7 +417,9 @@ class ModuleSubproc:
             self.proc.kill()
 
     def __enter__(self):
-        self.proc = subprocess.Popen(self._cmd, env=self._env)
+        self.proc = subprocess.Popen(
+            self._cmd, env=self._env, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
         self._kill_timer.start()
         return self.proc
 
@@ -417,12 +453,10 @@ def _check_server_readiness(server):
 
 def _check_http_server_readiness(server, config_overrides: Dict[str, Dict]):
     mode = "http"
-    verify = None
     cert = None
     # tls
     if config_overrides:
         mode = "https"
-        verify = config_overrides["use_in_test"]["ca_cert"]
         # mtls
         if "client_cert" and "client_key" in config_overrides["use_in_test"]:
             cert = (
@@ -432,11 +466,13 @@ def _check_http_server_readiness(server, config_overrides: Dict[str, Dict]):
     done = False
     while not done:
         try:
-            response = requests.get(
-                f"{mode}://localhost:{server.port}{http_server.HEALTH_ENDPOINT}",
-                verify=verify,
-                cert=cert,
-            )
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", module="urllib3")
+                response = requests.get(
+                    f"{mode}://localhost:{server.port}{http_server.HEALTH_ENDPOINT}",
+                    verify=False,
+                    cert=cert,
+                )
             assert response.status_code == 200
             assert response.text == "OK"
             done = True

@@ -17,24 +17,27 @@ The server is responsible for binding caikit workloads to a consistent REST/SSE
 API based on the task definitions available at boot.
 """
 # Standard
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Dict, Iterable, Optional, Type, Union, get_args
+from typing import Any, Dict, Iterable, List, Optional, Type, Union, get_args
 import asyncio
+import inspect
 import io
 import json
 import os
-import re
+import signal
 import ssl
 import tempfile
 import threading
 import time
+import traceback
+import uuid
 
 # Third Party
-from fastapi import FastAPI, HTTPException, Request, Response, status
+from fastapi import FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.encoders import jsonable_encoder
-from fastapi.exceptions import ResponseValidationError
+from fastapi.exceptions import RequestValidationError, ResponseValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse
 from grpc import StatusCode
 from sse_starlette import EventSourceResponse, ServerSentEvent
@@ -42,7 +45,10 @@ import pydantic
 import uvicorn
 
 # First Party
-from py_to_proto.dataclass_to_proto import get_origin  # Imported here for 3.8 compat
+from py_to_proto.dataclass_to_proto import (  # Imported here for 3.8 compat
+    Annotated,
+    get_origin,
+)
 import aconfig
 import alog
 
@@ -52,11 +58,27 @@ from .pydantic_wrapper import (
     pydantic_from_request,
     pydantic_to_dataobject,
 )
+from .request_aborter import HttpRequestAborter
 from .utils import convert_json_schema_to_multipart, flatten_json_schema
 from caikit.config import get_config
 from caikit.core.data_model import DataBase
 from caikit.core.data_model.dataobject import make_dataobject
+from caikit.core.exceptions import error_handler
+from caikit.core.exceptions.caikit_core_exception import (
+    CaikitCoreException,
+    CaikitCoreStatusCode,
+)
 from caikit.core.toolkit.sync_to_async import async_wrap_iter
+from caikit.runtime.names import (
+    HEALTH_ENDPOINT,
+    MODEL_ID,
+    MODELS_INFO_ENDPOINT,
+    OPTIONAL_INPUTS_KEY,
+    REQUIRED_INPUTS_KEY,
+    RUNTIME_INFO_ENDPOINT,
+    StreamEventTypes,
+    get_http_route_name,
+)
 from caikit.runtime.server_base import RuntimeServerBase
 from caikit.runtime.service_factory import ServicePackage
 from caikit.runtime.service_generation.rpcs import (
@@ -66,17 +88,19 @@ from caikit.runtime.service_generation.rpcs import (
 )
 from caikit.runtime.servicers.global_predict_servicer import GlobalPredictServicer
 from caikit.runtime.servicers.global_train_servicer import GlobalTrainServicer
+from caikit.runtime.servicers.info_servicer import InfoServicer
 from caikit.runtime.types.caikit_runtime_exception import CaikitRuntimeException
 
 ## Globals #####################################################################
 
 log = alog.use_channel("SERVR-HTTP")
+error = error_handler.get(log)
 
 
-# Mapping from GRPC codes to their corresponding HTTP codes
-# pylint: disable=line-too-long
-# CITE: https://chromium.googlesource.com/external/github.com/grpc/grpc/+/refs/tags/v1.21.4-pre1/doc/statuscodes.md
-GRPC_CODE_TO_HTTP = {
+STATUS_CODE_TO_HTTP = {
+    # Mapping from GRPC codes to their corresponding HTTP codes
+    # pylint: disable=line-too-long
+    # CITE: https://chromium.googlesource.com/external/github.com/grpc/grpc/+/refs/tags/v1.21.4-pre1/doc/statuscodes.md
     StatusCode.OK: 200,
     StatusCode.INVALID_ARGUMENT: 400,
     StatusCode.FAILED_PRECONDITION: 400,
@@ -93,17 +117,16 @@ GRPC_CODE_TO_HTTP = {
     StatusCode.UNIMPLEMENTED: 501,
     StatusCode.UNAVAILABLE: 501,
     StatusCode.DEADLINE_EXCEEDED: 504,
+    # Mapping from CaikitCore StatusCodes codes to their corresponding HTTP codes
+    CaikitCoreStatusCode.INVALID_ARGUMENT: 400,
+    CaikitCoreStatusCode.UNAUTHORIZED: 401,
+    CaikitCoreStatusCode.FORBIDDEN: 403,
+    CaikitCoreStatusCode.NOT_FOUND: 404,
+    CaikitCoreStatusCode.CONNECTION_ERROR: 500,
+    CaikitCoreStatusCode.UNKNOWN: 500,
+    CaikitCoreStatusCode.FATAL: 500,
 }
 
-
-# These keys are used to define the logical sections of the request and response
-# data structures.
-REQUIRED_INPUTS_KEY = "inputs"
-OPTIONAL_INPUTS_KEY = "parameters"
-MODEL_ID = "model_id"
-
-# Endpoint to use for health checks
-HEALTH_ENDPOINT = "/health"
 
 # Small dataclass for consolidating TLS files
 @dataclass
@@ -128,6 +151,26 @@ class RuntimeHTTPServer(RuntimeServerBase):
 
         self.app = FastAPI()
 
+        # Request validation
+        @self.app.exception_handler(RequestValidationError)
+        async def request_validation_exception_handler(
+            _, exc: RequestValidationError
+        ) -> Response:
+            err_code = status.HTTP_422_UNPROCESSABLE_ENTITY
+            error_content = {
+                "details": exc.errors()[0]["msg"]
+                if len(exc.errors()) > 0 and "msg" in exc.errors()[0]
+                else exc.errors(),
+                "additional_info": exc.errors(),
+                "code": err_code,
+                "id": uuid.uuid4().hex,
+            }
+            log.error("<RUN59871106E>", error_content, exc_info=True)
+            return JSONResponse(
+                content=jsonable_encoder(error_content),
+                status_code=err_code,
+            )
+
         # Response validation
         @self.app.exception_handler(ResponseValidationError)
         async def validation_exception_handler(_, exc: ResponseValidationError):
@@ -142,11 +185,14 @@ class RuntimeHTTPServer(RuntimeServerBase):
         # Placeholders for global servicers
         self.global_predict_servicer = None
         self.global_train_servicer = None
+        self.info_servicer = InfoServicer()
 
         # Set up inference if enabled
         if self.enable_inference:
             log.info("<RUN77183426I>", "Enabling HTTP inference service")
-            self.global_predict_servicer = GlobalPredictServicer(self.inference_service)
+            self.global_predict_servicer = GlobalPredictServicer(
+                self.inference_service, interrupter=self.interrupter
+            )
             self._bind_routes(self.inference_service)
 
         # Set up training if enabled
@@ -158,6 +204,15 @@ class RuntimeHTTPServer(RuntimeServerBase):
         # Add the health endpoint
         self.app.get(HEALTH_ENDPOINT, response_class=PlainTextResponse)(
             self._health_check
+        )
+
+        # Add runtime info endpoints
+        self.app.get(RUNTIME_INFO_ENDPOINT, response_class=JSONResponse)(
+            self.info_servicer.get_version_dict
+        )
+
+        self.app.get(MODELS_INFO_ENDPOINT, response_class=JSONResponse)(
+            self._model_info
         )
 
         # Parse TLS configuration
@@ -178,34 +233,45 @@ class RuntimeHTTPServer(RuntimeServerBase):
                 log.info("<RUN10539515I>", "Running INSECURE")
 
             # Start the server with a timeout_graceful_shutdown
-            # if not set in config, this is None and unvicorn accepts None or number of seconds
+            # if not set in config, this is None and unvicorn accepts None or
+            # number of seconds
             unvicorn_timeout_graceful_shutdown = (
                 get_config().runtime.http.server_shutdown_grace_period_seconds
             )
+            server_config = get_config().runtime.http.server_config
+            overlapping_tls_config = set(tls_kwargs).intersection(server_config)
+            error.value_check(
+                "<RUN30233180E>",
+                not overlapping_tls_config,
+                "Found overlapping config keys between TLS and server_config: %s",
+                overlapping_tls_config,
+            )
+            config_kwargs = {
+                "host": "0.0.0.0",
+                "port": self.port,
+                "log_level": None,
+                "log_config": None,
+                "timeout_graceful_shutdown": unvicorn_timeout_graceful_shutdown,
+            }
+            overlapping_kwarg_config = set(config_kwargs).intersection(server_config)
+            error.value_check(
+                "<RUN99488934E>",
+                not overlapping_kwarg_config,
+                "Found caikit-managed uvicorn config in server_config: %s",
+                overlapping_kwarg_config,
+            )
             config = uvicorn.Config(
                 self.app,
-                host="0.0.0.0",
-                port=self.port,
-                log_level=None,
-                log_config=None,
-                timeout_graceful_shutdown=unvicorn_timeout_graceful_shutdown,
+                **config_kwargs,
                 **tls_kwargs,
+                **server_config,
             )
             # Make sure the config loads TLS files here so they can safely be
             # deleted if they're ephemeral
             config.load()
 
-        # Start the server with the loaded config
+        # Build the server with the loaded config
         self.server = uvicorn.Server(config=config)
-
-        # Patch the exit handler to call this server's stop
-        original_handler = self.server.handle_exit
-
-        def shutdown_wrapper(*args, **kwargs):
-            original_handler(*args, **kwargs)
-            self.stop()
-
-        self.server.handle_exit = shutdown_wrapper
 
         # Placeholder for thread when running without blocking
         self._uvicorn_server_thread = None
@@ -221,10 +287,23 @@ class RuntimeHTTPServer(RuntimeServerBase):
         Args:
             blocking (boolean): Whether to block until shutdown
         """
+        log.info(
+            "<RUN10001002I>",
+            "Caikit Runtime is serving http on port: %s with thread pool size: %s",
+            self.port,
+            self.thread_pool._max_workers,
+        )
+
+        if self.interrupter:
+            self.interrupter.start()
+
+        # Patch the exit handler to retain correct signal handling behavior
+        self._patch_exit_handler()
+
         if blocking:
             self.server.run()
         else:
-            self.run_in_thread()
+            self._run_in_thread()
 
     def stop(self):
         """Stop the server, with an optional grace period.
@@ -233,11 +312,14 @@ class RuntimeHTTPServer(RuntimeServerBase):
             grace_period_seconds (Union[float, int]): Grace period for service shutdown.
                 Defaults to application config
         """
-        self.server.should_exit = True
+        log.info("Shutting down http server")
+
         if (
             self._uvicorn_server_thread is not None
             and self._uvicorn_server_thread.is_alive()
         ):
+            # This is required to notify the server in the thread to exit
+            self.server.should_exit = True
             self._uvicorn_server_thread.join()
 
         # Ensure we flush out any remaining billing metrics and stop metering
@@ -247,16 +329,20 @@ class RuntimeHTTPServer(RuntimeServerBase):
         # Shut down the model manager's model polling if enabled
         self._shut_down_model_manager()
 
-    def run_in_thread(self):
+        if self.interrupter:
+            self.interrupter.stop()
+
+    ##########
+    ## Impl ##
+    ##########
+
+    def _run_in_thread(self):
         self._uvicorn_server_thread = threading.Thread(target=self.server.run)
         self._uvicorn_server_thread.start()
         while not self.server.started:
             time.sleep(1e-3)
         log.info("HTTP Server is running in thread")
 
-    ##########
-    ## Impl ##
-    ##########
     def _bind_routes(self, service: ServicePackage):
         """Bind all rpcs as routes to the given app"""
         for rpc in service.caikit_rpcs.values():
@@ -265,7 +351,8 @@ class RuntimeHTTPServer(RuntimeServerBase):
                 if hasattr(rpc, "input_streaming") and rpc.input_streaming:
                     # Skipping the binding of this route since we don't have support
                     log.info(
-                        "No support for input streaming on REST Server yet! Skipping this rpc %s with input type %s",
+                        "No support for input streaming on REST Server yet!"
+                        "Skipping this rpc %s with input type %s",
                         rpc_info["name"],
                         rpc_info["input_type"],
                     )
@@ -277,7 +364,7 @@ class RuntimeHTTPServer(RuntimeServerBase):
             elif isinstance(rpc, ModuleClassTrainRPC):
                 self._train_add_unary_input_unary_output_handler(rpc)
 
-    def _get_model_id(self, request: Type[pydantic.BaseModel]) -> Dict[str, Any]:
+    def _get_model_id(self, request: Type[pydantic.BaseModel]) -> str:
         """Get the model id from the payload"""
         request_kwargs = dict(request)
         model_id = request_kwargs.get(MODEL_ID, None)
@@ -330,7 +417,7 @@ class RuntimeHTTPServer(RuntimeServerBase):
         pydantic_response = dataobject_to_pydantic(response_data_object)
 
         @self.app.post(
-            self._get_route(rpc),
+            get_http_route_name(rpc.name),
             responses=self._get_response_openapi(
                 response_data_object, pydantic_response
             ),
@@ -342,41 +429,44 @@ class RuntimeHTTPServer(RuntimeServerBase):
             log.debug("In unary handler for %s", rpc.name)
             loop = asyncio.get_running_loop()
 
-            # build request DM object
-            request = await pydantic_from_request(pydantic_request, context)
-            http_request_dm_object = pydantic_to_dataobject(request)
-
             try:
+                # build request DM object
+                request = await pydantic_from_request(pydantic_request, context)
+                http_request_dm_object = pydantic_to_dataobject(request)
+
                 call = partial(
                     self.global_train_servicer.run_training_job,
                     request=http_request_dm_object.to_proto(),
                     module=rpc.clz,
-                    training_output_dir=None,  # pass None so that GTS picks up the config one # TODO: double-check?
+                    training_output_dir=None,  # pass None so that GTS picks up the config one # TODO: double-check? # noqa: E501
                     # context=context,
-                    wait=True,
+                    wait=False,
                 )
                 result = await loop.run_in_executor(None, call)
                 if response_data_object.supports_file_operations:
                     return self._format_file_response(result)
 
                 return Response(content=result.to_json(), media_type="application/json")
+            except RequestValidationError as err:
+                raise err
             except HTTPException as err:
                 raise err
-            except CaikitRuntimeException as err:
-                error_code = GRPC_CODE_TO_HTTP.get(err.status_code, 500)
+            except (CaikitCoreException, CaikitRuntimeException) as err:
+                error_code = STATUS_CODE_TO_HTTP.get(err.status_code, 500)
                 error_content = {
                     "details": err.message,
                     "code": error_code,
                     "id": err.id,
                 }
+                log.error("<RUN87691106E>", error_content, exc_info=True)
             except Exception as err:  # pylint: disable=broad-exception-caught
                 error_code = 500
                 error_content = {
                     "details": f"Unhandled exception: {str(err)}",
                     "code": error_code,
-                    "id": None,
+                    "id": uuid.uuid4().hex,
                 }
-                log.error("<RUN51881106E>", err, exc_info=True)
+                log.error("<RUN51231106E>", error_content, exc_info=True)
             return Response(
                 content=json.dumps(error_content), status_code=error_code
             )  # pylint: disable=used-before-assignment
@@ -388,7 +478,7 @@ class RuntimeHTTPServer(RuntimeServerBase):
         pydantic_response = dataobject_to_pydantic(response_data_object)
 
         @self.app.post(
-            self._get_route(rpc),
+            get_http_route_name(rpc.name),
             responses=self._get_response_openapi(
                 response_data_object, pydantic_response
             ),
@@ -399,11 +489,10 @@ class RuntimeHTTPServer(RuntimeServerBase):
         async def _handler(
             context: Request,
         ) -> Response:
-
-            request = await pydantic_from_request(pydantic_request, context)
-            request_params = self._get_request_params(rpc, request)
-
             try:
+                request = await pydantic_from_request(pydantic_request, context)
+                request_params = self._get_request_params(rpc, request)
+
                 model_id = self._get_model_id(request)
                 log.debug4(
                     "Sending request %s to model id %s", request_params, model_id
@@ -417,22 +506,25 @@ class RuntimeHTTPServer(RuntimeServerBase):
                 log.debug4(
                     "Sending request %s to model id %s", request_params, model_id
                 )
-                model = self.global_predict_servicer._model_manager.retrieve_model(
-                    model_id
+
+                aborter_context = (
+                    HttpRequestAborter(context) if self.interrupter else nullcontext()
                 )
 
-                # TODO: use `async_wrap_*`?
-                call = partial(
-                    self.global_predict_servicer.predict_model,
-                    model_id=model_id,
-                    request_name=rpc.request.name,
-                    inference_func_name=model.get_inference_signature(
-                        output_streaming=False, input_streaming=False, task=rpc.task
-                    ).method_name,
-                    **request_params,
-                )
-                result = await loop.run_in_executor(None, call)
-                log.debug4("Response from model %s is %s", model_id, result)
+                with aborter_context as aborter:
+                    # TODO: use `async_wrap_*`?
+                    call = partial(
+                        self.global_predict_servicer.predict_model,
+                        model_id=model_id,
+                        request_name=rpc.request.name,
+                        input_streaming=False,
+                        output_streaming=False,
+                        task=rpc.task,
+                        aborter=aborter,
+                        **request_params,
+                    )
+                    result = await loop.run_in_executor(self.thread_pool, call)
+                    log.debug4("Response from model %s is %s", model_id, result)
 
                 if response_data_object.supports_file_operations:
                     return self._format_file_response(result)
@@ -441,21 +533,24 @@ class RuntimeHTTPServer(RuntimeServerBase):
 
             except HTTPException as err:
                 raise err
-            except CaikitRuntimeException as err:
-                error_code = GRPC_CODE_TO_HTTP.get(err.status_code, 500)
+            except RequestValidationError as err:
+                raise err
+            except (CaikitCoreException, CaikitRuntimeException) as err:
+                error_code = STATUS_CODE_TO_HTTP.get(err.status_code, 500)
                 error_content = {
                     "details": err.message,
                     "code": error_code,
                     "id": err.id,
                 }
+                log.error("<RUN53211098E>", error_content, exc_info=True)
             except Exception as err:  # pylint: disable=broad-exception-caught
                 error_code = 500
                 error_content = {
                     "details": f"Unhandled exception: {str(err)}",
                     "code": error_code,
-                    "id": None,
+                    "id": uuid.uuid4().hex,
                 }
-                log.error("<RUN51881106E>", err, exc_info=True)
+                log.error("<RUN98751106E>", error_content, exc_info=True)
             return Response(
                 content=json.dumps(error_content), status_code=error_code
             )  # pylint: disable=used-before-assignment
@@ -466,7 +561,7 @@ class RuntimeHTTPServer(RuntimeServerBase):
 
         # pylint: disable=unused-argument
         @self.app.post(
-            self._get_route(rpc),
+            get_http_route_name(rpc.name),
             response_model=pydantic_response,
             openapi_extra=self._get_request_openapi(pydantic_request),
         )
@@ -482,64 +577,72 @@ class RuntimeHTTPServer(RuntimeServerBase):
                     log.debug4(
                         "Sending request %s to model id %s", request_params, model_id
                     )
-                    model = self.global_predict_servicer._model_manager.retrieve_model(
-                        model_id
+
+                    aborter_context = (
+                        HttpRequestAborter(context)
+                        if self.interrupter
+                        else nullcontext()
                     )
 
-                    log.debug("In stream generator for %s", rpc.name)
-                    async for result in async_wrap_iter(
-                        self.global_predict_servicer.predict_model(
-                            model_id=model_id,
-                            request_name=rpc.request.name,
-                            inference_func_name=model.get_inference_signature(
-                                output_streaming=True, input_streaming=False
-                            ).method_name,
-                            **request_params,
-                        )
-                    ):
-                        yield result
+                    with aborter_context as aborter:
+                        log.debug("In stream generator for %s", rpc.name)
+                        async for result in async_wrap_iter(
+                            self.global_predict_servicer.predict_model(
+                                model_id=model_id,
+                                request_name=rpc.request.name,
+                                input_streaming=False,
+                                output_streaming=True,
+                                task=rpc.task,
+                                aborter=aborter,
+                                **request_params,
+                            ),
+                            pool=self.thread_pool,
+                        ):
+                            yield ServerSentEvent(
+                                data=result.to_json(),
+                                event=StreamEventTypes.MESSAGE.value,
+                            )
+
                     return
                 except HTTPException as err:
                     raise err
-                except CaikitRuntimeException as err:
-                    error_code = GRPC_CODE_TO_HTTP.get(err.status_code, 500)
+                except RequestValidationError as err:
+                    raise err
+                except (TypeError, ValueError) as err:
+                    log_dict = {
+                        "log_code": "<RUN76624264W>",
+                        "message": repr(err),
+                        "stack_trace": traceback.format_exc(),
+                    }
+                    log.warning(log_dict)
+                    error_code = 400
+                    error_content = {
+                        "details": repr(err),
+                        "code": error_code,
+                    }
+                except (CaikitCoreException, CaikitRuntimeException) as err:
+                    error_code = STATUS_CODE_TO_HTTP.get(err.status_code, 500)
                     error_content = {
                         "details": err.message,
                         "code": error_code,
                         "id": err.id,
                     }
+                    log.error("<RUN53234506E>", error_content, exc_info=True)
                 except Exception as err:  # pylint: disable=broad-exception-caught
                     error_code = 500
                     error_content = {
                         "details": f"Unhandled exception: {str(err)}",
                         "code": error_code,
-                        "id": None,
+                        "id": uuid.uuid4().hex,
                     }
-                    log.error("<RUN51881106E>", err, exc_info=True)
+                    log.error("<RUN51891206E>", error_content, exc_info=True)
 
                 # If an error occurs, yield an error response and terminate
-                yield ServerSentEvent(data=json.dumps(error_content))
+                yield ServerSentEvent(
+                    data=json.dumps(error_content), event=StreamEventTypes.ERROR.value
+                )
 
             return EventSourceResponse(_generator())
-
-    def _get_route(self, rpc: CaikitRPCBase) -> str:
-        """Get the REST route for this rpc"""
-        if rpc.name.endswith("Predict"):
-            task_name = re.sub(
-                r"(?<!^)(?=[A-Z])",
-                "-",
-                re.sub("Task$", "", re.sub("Predict$", "", rpc.name)),
-            ).lower()
-            route = "/".join([self.config.runtime.http.route_prefix, "task", task_name])
-            if route[0] != "/":
-                route = "/" + route
-            return route
-        if rpc.name.endswith("Train"):
-            route = "/".join([self.config.runtime.http.route_prefix, rpc.name])
-            if route[0] != "/":
-                route = "/" + route
-            return route
-        raise NotImplementedError("No support for train rpcs yet!")
 
     def _get_request_dataobject(self, rpc: CaikitRPCBase) -> Type[DataBase]:
         """Get the dataobject request for the given rpc"""
@@ -635,19 +738,26 @@ class RuntimeHTTPServer(RuntimeServerBase):
 
     @staticmethod
     def _get_request_openapi(
-        pydantic_model: Union[pydantic.BaseModel, Type[pydantic.BaseModel]]
+        pydantic_model: Union[pydantic.BaseModel, Type, Type[pydantic.BaseModel]]
     ):
         """Helper to generate the openapi schema for a given request"""
-        raw_schema = pydantic_model.model_json_schema()
-        parsed_schema = flatten_json_schema(raw_schema)
 
+        # Get the json schema from the pydantic model or TypeAdapter
+        if inspect.isclass(pydantic_model) and issubclass(
+            pydantic_model, pydantic.BaseModel
+        ):
+            raw_schema = pydantic_model.model_json_schema()
+        else:
+            raw_schema = pydantic.TypeAdapter(pydantic_model).json_schema()
+
+        parsed_schema = flatten_json_schema(raw_schema)
         multipart_schema = convert_json_schema_to_multipart(parsed_schema)
 
         return {
             "requestBody": {
                 "content": {
-                    "application/json": {"schema": parsed_schema},
                     "multipart/form-data": {"schema": multipart_schema},
+                    "application/json": {"schema": parsed_schema},
                 },
                 "required": True,
             }
@@ -655,7 +765,7 @@ class RuntimeHTTPServer(RuntimeServerBase):
 
     @staticmethod
     def _get_response_openapi(
-        dm_class: Type[DataBase], pydantic_model: Type[pydantic.BaseModel]
+        dm_class: Type[DataBase], pydantic_model: Union[Type, Type[pydantic.BaseModel]]
     ):
         """Helper to generate the openapi schema for a given response"""
 
@@ -664,14 +774,45 @@ class RuntimeHTTPServer(RuntimeServerBase):
                 "application/octet-stream": {"type": "string", "format": "binary"}
             }
         else:
-            response_schema = {
-                "application/json": flatten_json_schema(
-                    pydantic_model.model_json_schema()
-                )
-            }
+            # Get the json schema from the pydantic model or TypeAdapter
+            if inspect.isclass(pydantic_model) and issubclass(
+                pydantic_model, pydantic.BaseModel
+            ):
+                json_schema = pydantic_model.model_json_schema()
+            else:
+                json_schema = pydantic.TypeAdapter(pydantic_model).json_schema()
+
+            response_schema = {"application/json": flatten_json_schema(json_schema)}
 
         output = {200: {"content": response_schema}}
         return output
+
+    def _model_info(
+        self, model_ids: Annotated[List[str], Query(default_factory=list)]
+    ) -> Dict[str, Any]:
+        """Create wrapper for get_models_info so model_ids can be marked as a query parameter"""
+        try:
+            return self.info_servicer.get_models_info_dict(model_ids)
+        except HTTPException as err:
+            raise err
+        except CaikitRuntimeException as err:
+            error_code = STATUS_CODE_TO_HTTP.get(err.status_code, 500)
+            error_content = {
+                "details": err.message,
+                "code": error_code,
+                "id": err.id,
+            }
+            log.error("<RUN87691106E>", error_content, exc_info=True)
+            return error_content
+        except Exception as err:  # pylint: disable=broad-exception-caught
+            error_code = 500
+            error_content = {
+                "details": f"Unhandled exception: {str(err)}",
+                "code": error_code,
+                "id": uuid.uuid4().hex,
+            }
+            log.error("<RUN51231106E>", error_content, exc_info=True)
+            return error_content
 
     @staticmethod
     def _health_check() -> str:
@@ -717,15 +858,39 @@ class RuntimeHTTPServer(RuntimeServerBase):
         except OSError as err:
             log.error(
                 "<RUN80977064E>",
-                "Cannot create temporary TLS files. Either pass config as file paths or run with write permissions.",
+                (
+                    "Cannot create temporary TLS files."
+                    "Either pass config as file paths or run with write permissions."
+                ),
                 exc_info=True,
             )
             raise ValueError() from err
 
+    def _patch_exit_handler(self):
+        """
+        🌶️🌶️🌶️ Here there are dragons! 🌶️🌶️🌶️
+        uvicorn will explicitly set the interrupt handler to `server.handle_exit` when
+        `server.run()` is called. That will override any other signal handlers that we
+        may have tried to set.
+
+        To work around this, we:
+        1. Register `server.handle_exit` as a SIGINT/SIGTERM signal handler ourselves, so that it
+          is invoked on interrupt and terminate
+        2. Set `server.handle_exit` to the existing SIGINT signal handler, so that when the uvicorn
+          server explicitly overrides the signal handler for SIGINT and SIGTERM to this, it has no
+          effect.
+
+        Since uvicorn overrides SIGINT and SIGTERM with a single common handler, any special
+            handlers added for SIGTERM but not SIGINT will not be invoked.
+        """
+        original_exit_handler = self.server.handle_exit
+        self._add_signal_handler(signal.SIGINT, original_exit_handler)
+        self._add_signal_handler(signal.SIGTERM, original_exit_handler)
+        self.server.handle_exit = signal.getsignal(signal.SIGINT)
+
 
 def main(blocking: bool = True):
     server = RuntimeHTTPServer()
-    server._intercept_interrupt_signal()
     server.start(blocking)
 
 

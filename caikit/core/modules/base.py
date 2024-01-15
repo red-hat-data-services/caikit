@@ -48,6 +48,7 @@ from caikit import core
 log = alog.use_channel("MODULE")
 error = error_handler.get(log)
 
+
 # pylint: disable=too-many-public-methods
 class ModuleBase(metaclass=_ModuleBaseMeta):
     """Abstract base class from which all modules should inherit."""
@@ -78,6 +79,33 @@ class ModuleBase(metaclass=_ModuleBaseMeta):
             self._metadata = {}
         return self._metadata
 
+    @property
+    def module_metadata(cls) -> Dict[str, Any]:
+        """Helper property to return metadata about a Module. This function
+        is separate from `metadata` as this is specific for the class module. This
+        function also requires a flat metadata structure without nested dictionaries.
+
+        NOTE: This should be a @classmethod but using @property/@classmethod together has
+        been deprecated
+
+        Returns:
+            Dict[str, str]: A dictionary of this ModuleBases's metadata
+        """
+
+        return {"name": cls.MODULE_NAME, "version": cls.MODULE_VERSION}
+
+    @property
+    def public_model_info(cls) -> Dict[str, Any]:
+        """Helper property to return public metadata about a specific Model. This
+        function is separate from `metdata` as that contains the entire ModelConfig
+        which might not want to be shared/exposed.
+
+        Returns:
+            Dict[str, str]: A dictionary of this models's public metadata
+        """
+
+        return {}
+
     def set_load_backend(self, load_backend):
         """Method used by the model manager to indicate the load backend that
         was used to load this module
@@ -89,8 +117,8 @@ class ModuleBase(metaclass=_ModuleBaseMeta):
         cls,
         input_streaming: bool,
         output_streaming: bool,
-        task: Type["caikit.core.TaskBase"] = None,
-    ) -> Optional["caikit.core.signature_parsing.CaikitMethodSignature"]:
+        task: Type["core.TaskBase"] = None,
+    ) -> Optional["core.signature_parsing.CaikitMethodSignature"]:
         """Returns the inference method signature that is capable of running the module's task
         for the given flavors of input and output streaming
         """
@@ -109,8 +137,8 @@ class ModuleBase(metaclass=_ModuleBaseMeta):
 
     @classmethod
     def get_inference_signatures(
-        cls, task: Type["caikit.core.TaskBase"]
-    ) -> List[Tuple[bool, bool, "caikit.core.signature_parsing.CaikitMethodSignature"]]:
+        cls, task: Type["core.TaskBase"]
+    ) -> List[Tuple[bool, bool, "core.signature_parsing.CaikitMethodSignature"]]:
         """Returns inference method signatures for all supported flavors
         of input and output streaming for a given task
         """
@@ -369,8 +397,7 @@ class ModuleBase(metaclass=_ModuleBaseMeta):
         time_passed = time.time() - start_time
 
         # stop on seconds or iterations depending on input arguments
-        # pylint: disable=unnecessary-lambda-assignment
-        continue_condition = (
+        continue_condition = (  # noqa: E731 # lambda-assignment
             lambda t_p, i_p: t_p <= num_seconds if num_seconds else i_p < num_iterations
         )
         response = None
@@ -741,10 +768,7 @@ class ModuleBase(metaclass=_ModuleBaseMeta):
             return fileio.load_json(dataset_path)
 
         # if all else fails
-        error(
-            "<COR81451234E>",
-            ValueError("Unsure of how to load: {0}".format(dataset_path)),
-        )
+        error("<COR81451234E>", ValueError(f"Unsure of how to load: {dataset_path}"))
 
     @staticmethod
     def _extract_gold_annotations(gold_set):

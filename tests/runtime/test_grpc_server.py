@@ -18,12 +18,10 @@
 from dataclasses import dataclass
 from unittest import mock
 import json
-import os
 import signal
 import tempfile
 import threading
 import time
-import uuid
 
 # Third Party
 from google.protobuf.descriptor_pool import DescriptorPool
@@ -34,6 +32,7 @@ from grpc_reflection.v1alpha.proto_reflection_descriptor_database import (
 )
 import grpc
 import pytest
+import requests
 import tls_test_tools
 
 # First Party
@@ -41,15 +40,22 @@ import alog
 
 # Local
 from caikit import get_config
-from caikit.core import MODEL_MANAGER
 from caikit.core.data_model.producer import ProducerId
 from caikit.interfaces.runtime.data_model import (
+    ModelInfoRequest,
+    ModelInfoResponse,
+    RuntimeInfoRequest,
+    RuntimeInfoResponse,
     TrainingInfoRequest,
     TrainingJob,
-    TrainingStatus,
     TrainingStatusResponse,
 )
-from caikit.runtime import get_inference_request, get_train_params, get_train_request
+from caikit.runtime import (
+    get_inference_request,
+    get_train_params,
+    get_train_request,
+    http_server,
+)
 from caikit.runtime.grpc_server import RuntimeGRPCServer
 from caikit.runtime.model_management.model_manager import ModelManager
 from caikit.runtime.protobufs import (
@@ -69,11 +75,12 @@ from sample_lib.data_model import (
 )
 from sample_lib.data_model.sample import OtherTask, SampleTask, StreamingTask
 from sample_lib.modules import FirstTask
-from tests.conftest import random_test_id, temp_config
+from tests.conftest import ARM_ARCH, PROTOBUF_VERSION, random_test_id, temp_config
 from tests.core.helpers import *
 from tests.fixtures import Fixtures
 from tests.runtime.conftest import (
     ModuleSubproc,
+    _open_port,
     register_trained_model,
     runtime_grpc_test_server,
 )
@@ -832,7 +839,7 @@ def test_load_model_badmodel_error_response(runtime_grpc_server):
             modelKey="baz",
         )
         stub.loadModel(load_model_request)
-    assert context.value.code() == grpc.StatusCode.INTERNAL
+    assert context.value.code() == grpc.StatusCode.NOT_FOUND
 
 
 def test_unload_model_ok_response(sample_task_model_id, runtime_grpc_server):
@@ -953,6 +960,110 @@ def test_runtime_status_ok_response(runtime_grpc_server):
     assert actual_response.numericRuntimeVersion == 0
 
 
+def test_runtime_info_ok_response(runtime_grpc_server):
+    runtime_info_service: ServicePackage = ServicePackageFactory().get_service_package(
+        ServicePackageFactory.ServiceType.INFO,
+    )
+
+    runtime_info_stub = runtime_info_service.stub_class(
+        runtime_grpc_server.make_local_channel()
+    )
+
+    runtime_request = RuntimeInfoRequest()
+    runtime_info_response: RuntimeInfoResponse = RuntimeInfoResponse.from_proto(
+        runtime_info_stub.GetRuntimeInfo(runtime_request.to_proto())
+    )
+
+    assert "caikit" in runtime_info_response.python_packages
+    # runtime_version not added if not set
+    assert runtime_info_response.runtime_version == ""
+    # dependent libraries not added if all packages not set to true
+    assert "py_to_proto" not in runtime_info_response.python_packages
+
+
+def test_runtime_info_ok_response_all_packages(runtime_grpc_server):
+    with temp_config(
+        {
+            "runtime": {
+                "version_info": {
+                    "python_packages": {
+                        "all": True,
+                    },
+                    "runtime_image": "1.2.3",
+                }
+            },
+        },
+        "merge",
+    ):
+        runtime_info_service: ServicePackage = (
+            ServicePackageFactory().get_service_package(
+                ServicePackageFactory.ServiceType.INFO,
+            )
+        )
+
+        runtime_info_stub = runtime_info_service.stub_class(
+            runtime_grpc_server.make_local_channel()
+        )
+
+        runtime_request = RuntimeInfoRequest()
+        runtime_info_response: RuntimeInfoResponse = RuntimeInfoResponse.from_proto(
+            runtime_info_stub.GetRuntimeInfo(runtime_request.to_proto())
+        )
+
+        assert "caikit" in runtime_info_response.python_packages
+        assert runtime_info_response.runtime_version == "1.2.3"
+        # dependent libraries versions added
+        assert "alog" in runtime_info_response.python_packages
+        assert "py_to_proto" in runtime_info_response.python_packages
+
+
+def test_all_model_info_ok_response(runtime_grpc_server, sample_task_model_id):
+    info_service: ServicePackage = ServicePackageFactory().get_service_package(
+        ServicePackageFactory.ServiceType.INFO,
+    )
+
+    model_info_stub = info_service.stub_class(runtime_grpc_server.make_local_channel())
+
+    model_request = ModelInfoRequest()
+    model_info_response: ModelInfoResponse = ModelInfoResponse.from_proto(
+        model_info_stub.GetModelsInfo(model_request.to_proto())
+    )
+
+    assert len(model_info_response.models) > 0
+
+    found_sample_task = False
+    for model in model_info_response.models:
+        # Assert name and id exist
+        assert model.name and model.module_id
+        # Assert metadata module_name matches expected
+        if model.name == sample_task_model_id:
+            assert model.module_metadata.get("name") == "SampleModule"
+            found_sample_task = True
+
+    assert found_sample_task, "Unable to find sample_task model in models list"
+
+
+def test_single_model_info_ok_response(runtime_grpc_server, sample_task_model_id):
+    info_service: ServicePackage = ServicePackageFactory().get_service_package(
+        ServicePackageFactory.ServiceType.INFO,
+    )
+
+    model_info_stub = info_service.stub_class(runtime_grpc_server.make_local_channel())
+
+    model_request = ModelInfoRequest(model_ids=[sample_task_model_id])
+    model_info_response: ModelInfoResponse = ModelInfoResponse.from_proto(
+        model_info_stub.GetModelsInfo(model_request.to_proto())
+    )
+
+    # Assert only one model was returned
+    assert len(model_info_response.models) == 1
+    model = model_info_response.models[0]
+    # Assert name and id exist
+    assert model.name and model.module_id
+    # Assert metadata module_name matches expected
+    assert model.module_metadata.get("name") == "SampleModule"
+
+
 #### Health Probe tests ####
 def test_grpc_health_probe_ok_response(runtime_grpc_server):
     """Test health check successful response"""
@@ -962,6 +1073,9 @@ def test_grpc_health_probe_ok_response(runtime_grpc_server):
     assert actual_response.status == 1
 
 
+@pytest.mark.skipif(
+    PROTOBUF_VERSION < 4 and ARM_ARCH, reason="protobuf 3 serialization bug"
+)
 def test_grpc_server_can_render_all_necessary_protobufs(
     runtime_grpc_server, sample_inference_service, sample_train_service, tmp_path
 ):
@@ -995,8 +1109,8 @@ def test_canceling_model_loads_causes_exceptions(runtime_grpc_server):
     )
 
     def never_return(*args, **kwargs):
-        request_received.set()
         try:
+            request_received.set()
             while True:
                 time.sleep(0.01)
         except Exception as e:
@@ -1013,7 +1127,7 @@ def test_canceling_model_loads_causes_exceptions(runtime_grpc_server):
         load_model_future.cancel()
 
         # Wait for an exception to be raised in our mock, and assert it was
-        request_finished.wait(10)
+        request_finished.wait(2)
         assert request_finished.is_set()
 
 
@@ -1057,6 +1171,49 @@ def test_mtls(open_port):
             stub = health_pb2_grpc.HealthStub(bad_channel)
             health_check_request = health_pb2.HealthCheckRequest()
             stub.Check(health_check_request)
+
+
+def test_mtls_different_root(open_port):
+    """Make sure mtls communication works when the CA for the client is not the
+    same as the CA for the server (including health checks using the server's
+    CA)
+    """
+    # Server TLS Infra
+    server_ca_key = tls_test_tools.generate_key()[0]
+    server_ca_cert = tls_test_tools.generate_ca_cert(server_ca_key)
+    server_tls_key, server_tls_cert = tls_test_tools.generate_derived_key_cert_pair(
+        server_ca_key
+    )
+
+    # Client TLS Infra
+    client_ca_key = tls_test_tools.generate_key()[0]
+    client_ca_cert = tls_test_tools.generate_ca_cert(
+        client_ca_key, common_name="my.client"
+    )
+    client_tls_key, client_tls_cert = tls_test_tools.generate_derived_key_cert_pair(
+        client_ca_key, common_name="my.client"
+    )
+
+    server_tls_config = TLSConfig(
+        server=KeyPair(cert=server_tls_cert, key=server_tls_key),
+        client=KeyPair(cert=client_ca_cert, key=""),
+    )
+    with runtime_grpc_test_server(
+        open_port,
+        tls_config_override=server_tls_config,
+    ) as server:
+        # Connect using the client's creds
+        _assert_connection(
+            _make_secure_channel(
+                server, server_ca_cert, client_tls_key, client_tls_cert
+            )
+        )
+        # Connect using the server's creds
+        _assert_connection(
+            _make_secure_channel(
+                server, server_ca_cert, server_tls_key, server_tls_cert
+            )
+        )
 
 
 @pytest.mark.parametrize(
@@ -1244,6 +1401,63 @@ def test_grpc_sever_shutdown_with_model_poll(open_port):
         assert not server_proc.killed
 
 
+def test_all_signal_handlers_invoked(open_port):
+    """Test that a SIGINT successfully shuts down all running servers"""
+
+    # whoops, need 2 ports. Try to find another open one that isn't the one we already have
+    other_open_port = _open_port(start=open_port + 1)
+
+    with tempfile.TemporaryDirectory() as workdir:
+        server_proc = ModuleSubproc(
+            "caikit.runtime",
+            kill_timeout=30.0,
+            RUNTIME_GRPC_PORT=str(open_port),
+            RUNTIME_HTTP_PORT=str(other_open_port),
+            RUNTIME_LOCAL_MODELS_DIR=workdir,
+            RUNTIME_LAZY_LOAD_LOCAL_MODELS="true",
+            RUNTIME_LAZY_LOAD_POLL_PERIOD_SECONDS="0.1",
+            RUNTIME_METRICS_ENABLED="false",
+            RUNTIME_GRPC_ENABLED="true",
+            RUNTIME_HTTP_ENABLED="true",
+            LOG_LEVEL="info",
+        )
+        with server_proc as proc:
+            # Wait for the grpc server to be up:
+            _assert_connection(
+                grpc.insecure_channel(f"localhost:{open_port}"), max_failures=500
+            )
+
+            # Then wait for the http server as well:
+            http_failures = 0
+            while http_failures < 500:
+                try:
+                    resp = requests.get(
+                        f"http://localhost:{other_open_port}{http_server.HEALTH_ENDPOINT}",
+                        timeout=0.1,
+                    )
+                    resp.raise_for_status()
+                    break
+                except (
+                    requests.HTTPError,
+                    requests.ConnectionError,
+                    requests.ConnectTimeout,
+                ):
+                    http_failures += 1
+                    # tiny sleep because a connection refused won't hit the full `0.1`s timeout
+                    time.sleep(0.001)
+
+            # Signal the server to shut down
+            proc.send_signal(signal.SIGINT)
+
+        # Make sure the process was not killed
+        assert not server_proc.killed
+        # Check the logs (barf) to see if both grpc and http signal handlers called
+        # communicate returns (stdout, stderr) in bytes
+        logs = server_proc.proc.communicate()[1].decode("utf-8")
+        assert "Shutting down gRPC server" in logs
+        assert "Shutting down http server" in logs
+
+
 def test_construct_with_options(open_port, sample_train_service, sample_int_file):
     """Make sure that the server can be booted with config options"""
     with temp_config(
@@ -1281,6 +1495,25 @@ def test_construct_with_options(open_port, sample_train_service, sample_int_file
             with pytest.raises(grpc.RpcError) as context:
                 train_stub.OtherTaskOtherModuleTrain(train_request)
             assert context.value.code() == grpc.StatusCode.RESOURCE_EXHAUSTED
+
+
+def test_grpc_server_socket_listen():
+    """Make sure that the server correctly listen on a unix socket"""
+    with tempfile.TemporaryDirectory() as socket_dir:
+        with temp_config(
+            {"runtime": {"grpc": {"unix_socket_path": socket_dir + "/grpc.sock"}}},
+            "merge",
+        ):
+            with RuntimeGRPCServer():
+                stub = model_runtime_pb2_grpc.ModelRuntimeStub(
+                    grpc.insecure_channel(f"unix://{socket_dir}/grpc.sock")
+                )
+                runtime_status_request = model_runtime_pb2.RuntimeStatusRequest()
+                actual_response = stub.runtimeStatus(runtime_status_request)
+                assert (
+                    actual_response.status
+                    == model_runtime_pb2.RuntimeStatusResponse.READY
+                )
 
 
 # Test implementation details #########################

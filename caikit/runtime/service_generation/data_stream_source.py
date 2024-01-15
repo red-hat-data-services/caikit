@@ -41,7 +41,7 @@ from caikit.interfaces.common.data_model.stream_sources import (
     ListOfFileReferences,
     S3Files,
 )
-from caikit.runtime.service_generation.proto_package import get_runtime_service_package
+from caikit.runtime.names import get_service_package_name
 from caikit.runtime.types.caikit_runtime_exception import CaikitRuntimeException
 import caikit
 
@@ -321,7 +321,7 @@ class JsonDataStreamSourcePlugin(DataStreamSourcePlugin):
         if stream_message_type:
             return stream_message_type
 
-        package = get_runtime_service_package()
+        package = get_service_package_name()
         cls_name = _make_data_stream_source_type_name(element_type)
         JsonData = make_dataobject(
             package=package,
@@ -422,8 +422,9 @@ class DataStreamSourceBase(DataStream):
         super().__init__(self._generator)
 
     def _generator(self):
-        stream = self.to_data_stream()
-        return stream.generator_func(*stream.generator_args, **stream.generator_kwargs)
+        return self._stream.generator_func(
+            *self._stream.generator_args, **self._stream.generator_kwargs
+        )
 
     def __getstate__(self) -> bytes:
         """A DataStreamSource is pickled by serializing its source
@@ -449,6 +450,13 @@ class DataStreamSourceBase(DataStream):
         return {
             plugin.get_field_name(self.ELEMENT_TYPE): plugin for plugin in self.PLUGINS
         }
+
+    @cached_property
+    def _stream(self):
+        """The internal _stream is cached here so that the result of calling to_data_stream can be
+        re-read, rather than requiring to_data_stream to be invoked on every read through the
+        stream"""
+        return self.to_data_stream()
 
     # pylint: disable=too-many-return-statements
     def to_data_stream(self) -> DataStream:
@@ -498,7 +506,7 @@ def make_data_stream_source(
     log.debug2("Looking for DataStreamSource[%s]", data_element_type)
     if data_element_type not in _DATA_STREAM_SOURCE_TYPES:
         cls_name = _make_data_stream_source_type_name(data_element_type)
-        package = get_runtime_service_package()
+        package = get_service_package_name()
 
         log.debug("Creating DataStreamSource[%s] -> %s", data_element_type, cls_name)
 
@@ -589,7 +597,7 @@ def make_data_stream_source(
                 ) from err
             DataStreamSourceBase.__init__(self)
 
-        setattr(data_object, "__init__", __init__)
+        data_object.__init__ = __init__
 
         _DATA_STREAM_SOURCE_TYPES[data_element_type] = data_object
 
